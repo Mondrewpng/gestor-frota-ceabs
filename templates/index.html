@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Gestor SAFE</title>
+
+    <link href="jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css
+
+    <style>
+
+        body{
+            background-color:#f5f7fa;
+        }
+
+        .navbar-brand{
+            font-weight:700;
+        }
+
+        .card-kpi{
+            border:none;
+            border-radius:15px;
+            box-shadow:0 2px 12px rgba(0,0,0,.08);
+            transition:.2s;
+        }
+
+        .card-kpi:hover{
+            transform:translateY(-3px);
+        }
+
+        .kpi-number{
+            font-size:2.3rem;
+            font-weight:700;
+        }
+
+        .table-card{
+            background:white;
+            border-radius:15px;
+            padding:20px;
+            box-shadow:0 2px 12px rgba(0,0,0,.08);
+        }
+
+        .header-title{
+            font-weight:700;
+        }
+
+        .risk-badge{
+            font-size:.9rem;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+<nav class="navbar navbar-dark bg-primary mb-4">
+    <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">
+            SAFE • Dashboard Operacional
+        </span>
+    </div>
+</nav>
+
+<div class="container-fluid">
+
+    <div class="row g-4">
+
+        <div class="col-md-4">
+            <div class="card card-kpi">
+                <div class="card-body">
+
+                    <h6 class="text-muted">
+                        TOTAL DE ALARMES
+                    </h6>
+
+                    <div class="kpi-number text-primary">
+                        {{ total_alarmes }}
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-4">
+            <div class="card card-kpi">
+                <div class="card-body">
+
+                    <h6 class="text-muted">
+                        VEÍCULOS MONITORADOS
+                    </h6>
+
+                    <div class="kpi-number text-success">
+                        {{ total_veiculos }}
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-4">
+            <div class="card card-kpi">
+                <div class="card-body">
+
+                    <h6 class="text-muted">
+                        TIPOS DE ALARME
+                    </h6>
+
+                    <div class="kpi-number text-danger">
+                        {{ total_tipos }}
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="row mt-4">
+
+        <div class="col-md-12">
+
+            <div class="table-card">
+
+                <div class="d-flex justify-content-between mb-3">
+
+                    <h4 class="header-title">
+                        Últimos Eventos
+                    </h4>
+
+                    <span class="badge bg-primary">
+                        Atualizado automaticamente
+                    </span>
+
+                </div>
+
+                <table class="table table-hover align-middle">
+
+                    <thead class="table-dark">
+
+                        <tr>
+                            <th>Placa</th>
+                            <th>Evento</th>
+                            <th>Data</th>
+                            <th>Risco</th>
+                        </tr>
+
+                    </thead>
+
+                    <tbody>
+
+                    {% for item in ultimos %}
+
+                    <tr>
+
+                        <td>
+                            <strong>{{ item.placa }}</strong>
+                        </td>
+
+                        <td>
+                            {{ item.descricao }}
+                        </td>
+
+                        <td>
+                            {{ item.data_hora }}
+                        </td>
+
+                        <td>
+
+                            {% if item.nivel_risco == 'alto' %}
+
+                                <span class="badge bg-danger risk-badge">
+                                    Alto
+                                </span>
+
+                            {% elif item.nivel_risco == 'medio' %}
+
+                                <span class="badge bg-warning text-dark risk-badge">
+                                    Médio
+                                </span>
+
+                            {% else %}
+
+                                <span class="badge bg-success risk-badge">
+                                    Baixo
+                                </span>
+
+                            {% endif %}
+
+                        </td>
+
+                    </tr>
+
+                    {% endfor %}
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.bundle.min.jsscript>
+
+</body>
+
+</html>

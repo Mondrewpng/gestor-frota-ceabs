@@ -1,0 +1,102 @@
+{% extends 'base.html' %}
+
+{% block content %}
+
+<div class="container-fluid mt-4">
+
+    <h1 class="mb-4">
+        Dashboard SAFE
+    </h1>
+
+    <div class="row">
+
+        <div class="col-md-3">
+
+            <div class="card bg-primary text-white">
+
+                <div class="card-body">
+
+                    <h6>Total Alarmes</h6>
+
+                    <h1>{{ total_alarmes }}</h1>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="col-md-3">
+
+            <div class="card bg-success text-white">
+
+                <div class="card-body">
+
+                    <h6>Veículos</h6>
+
+                    <h1>{{ total_veiculos }}</h1>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="col-md-3">
+
+            <div class="card bg-warning">
+
+                <div class="card-body">
+
+                    <h6>Tipos de Alarmes</h6>
+
+                    <h1>{{ total_tipos }}</h1>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="col-md-3">
+
+            <div class="card bg-danger text-white">
+
+                <div class="card-body">
+
+                    <h6>Hoje</h6>
+
+                    <h1>{{ alarmes_hoje }}</h1>
+
+                </div>
+
+            </div>
+
+        </div>
+
+    </div>
+
+    <div class="card mt-4">
+
+        <div class="card-body">
+
+            <h4>Últimos Eventos</h4>
+
+            <table class="table table-striped">
+
+                <thead>
+
+                <tr>
+                    <th>Placa</th>
+                    <th>Evento</th>
+                    <th>Data</th>
+                    <th>Risco</th>
+                </tr>
+
+                </thead>
+
+                <tbody>
+
+                {% for item in ultimos %}
+
+                <tr
