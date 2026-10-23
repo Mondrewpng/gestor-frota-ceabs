@@ -1,43 +1,103 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import sqlite3
-import plotly.express as px
-import plotly.graph_objects as go
-import subprocess
-import io
+# -*- coding: utf-8 -*-
+# ==============================================================================
+# GESTOR CEABS • EXECUTIVE FLEET COCKPIT (v3 - navegação por abas e dados corrigidos)
+# Dependências: pip install streamlit plotly pandas numpy openpyxl fpdf2 requests urllib3
+# Execução:    streamlit run dashboard.py
+# ==============================================================================
 import os
+import io
 import sys
-from datetime import datetime, timedelta, time
+import ssl
+import sqlite3
+import subprocess
+from datetime import datetime, timedelta
+
+import requests
+import urllib3
+import numpy as np
+import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
+
+# ------------------------------------------------------------------------------
+# BYPASS SSL PARA REDE CORPORATIVA (mantido conforme original)
+# ------------------------------------------------------------------------------
+os.environ["GRPC_PYTHON_DISABLE_CERTIFICATE_VERIFICATION"] = "1"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
 # ==============================================================================
-# 1. CONFIGURAÇÃO GERAL DA APLICAÇÃO
+# 1. CONFIGURAÇÃO GERAL E IDENTIDADE VISUAL
 # ==============================================================================
 st.set_page_config(
-    page_title="Gestor CEABS | API Complementar & Telemetria",
+    page_title="Gestor CEABS | Executive Fleet Cockpit",
     page_icon="🚛",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-BANCO = r"C:\Users\paulo.herrera\OneDrive - VIC\Área de Trabalho\BancoAPI\SQL - e-Frotas\Gestor - Ceabs.db"
-INTERVALO_CARGA_MINUTOS = 20
+PASTA_PROJETO = r"C:\Users\paulo.herrera\OneDrive - VIC\Área de Trabalho\BancoAPI\SQL - e-Frotas"
+BANCO = os.path.join(PASTA_PROJETO, "Gestor - Ceabs.db")
 
-USUARIOS_VALIDOS = {
-    "Paulo": "123",
-    "Ocimar": "456",
-    "Marcelo": "789"
-}
+VERDE = "#00C853"
+AZUL = "#0284C7"
+ROXO = "#7C3AED"
+AMBAR = "#F59E0B"
+VERMELHO = "#EF4444"
+ROSA = "#EC4899"
+INK = "#0F172A"
+CORES = [VERDE, AZUL, ROXO, AMBAR, VERMELHO, ROSA]
 
-if "autenticado" not in st.session_state:
-    st.session_state["autenticado"] = False
-if "usuario_atual" not in st.session_state:
-    st.session_state["usuario_atual"] = ""
+MENU_VISAO = "🏠 Visão Geral"
+MENU_MAPA = "🗺️ Mapa Operacional"
+MENU_RANKING = "📊 Rankings"
+MENU_RAIOX = "🚛 Raio-X"
+MENU_CONDUTORES = "👤 Condutores"
+MENU_EVENTOS = "⚡ Eventos"
+MENU_IA = "🤖 Assistente IA"
+MENU_AUDITORIA = "🔍 Auditoria"
+MENU_EXPORT = "📤 Exportar"
+PAGINAS = [MENU_VISAO, MENU_MAPA, MENU_RANKING, MENU_RAIOX, MENU_CONDUTORES,
+           MENU_EVENTOS, MENU_IA, MENU_AUDITORIA, MENU_EXPORT]
 
-# Dicionário Oficial de Tradução dos IDs de Infrações CPS
+# ==============================================================================
+# 2. OLLAMA LOCAL
+# ==============================================================================
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5:3b"
+
+
+def perguntar_ollama(prompt):
+    try:
+        resposta = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_ctx": 1024, "temperature": 0.2, "num_predict": 300},
+            },
+            timeout=120,
+        )
+        if resposta.status_code != 200:
+            return f"⚠️ Erro do Ollama (Status {resposta.status_code}): {resposta.text}"
+        return resposta.json().get("response", "Sem resposta estruturada do modelo local.")
+    except requests.exceptions.ConnectionError:
+        return "⚠️ Não foi possível ligar ao Ollama em `localhost:11434`. Verifique se o serviço está aberto."
+    except Exception as erro:
+        return f"⚠️ Erro ao comunicar com o Ollama local: {erro}"
+
+
 MAPA_INFRACOES_CPS = {
     45: "Aceleração Brusca",
     46: "Freada Brusca",
@@ -51,1158 +111,1147 @@ MAPA_INFRACOES_CPS = {
     107: "Ignição sem Farol",
     996: "Deslocamento Fim de Semana",
     997: "Deslocamento Fora do Horário Comercial",
-    998: "Excesso de Velocidade na Via"
+    998: "Excesso de Velocidade na Via",
 }
 
-# Detecção inteligente da versão do Plotly
-if hasattr(go, "Densitymap"):
-    DensityTrace = go.Densitymap
-    ScatterTrace = go.Scattermap
-    MAP_LAYOUT_KEY = "map"
+# ==============================================================================
+# 3. TRACES DO PLOTLY (MAP / MAPBOX)
+# ==============================================================================
+if hasattr(go, "Scattermap"):
+    ScatterTrace, MAP_LAYOUT_KEY = go.Scattermap, "map"
+elif hasattr(go, "Scattermapbox"):
+    ScatterTrace, MAP_LAYOUT_KEY = go.Scattermapbox, "mapbox"
 else:
-    DensityTrace = getattr(go, "Densitymapbox", go.Scattermapbox)
-    ScatterTrace = getattr(go, "Scattermapbox", None)
-    MAP_LAYOUT_KEY = "mapbox"
+    ScatterTrace, MAP_LAYOUT_KEY = go.Scatter, "mapbox"
+
+if hasattr(go, "Densitymapbox"):
+    DensityTrace = go.Densitymapbox
+elif hasattr(go, "Densitymap"):
+    DensityTrace = go.Densitymap
+else:
+    DensityTrace = go.Scatter
 
 # ==============================================================================
-# 2. ESTILIZAÇÃO CSS (ROXO QUASE PRETO + VERDE NEON, ANIMAÇÕES LEVES)
+# 4. ESTILO VISUAL (CSS leve: poucas animações, navegação em abas)
 # ==============================================================================
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-    :root {
-        --bg-0: #05030B;
-        --bg-1: #0B0716;
-        --roxo: #7928CA;
-        --roxo-claro: #9D4EDD;
-        --roxo-soft: rgba(121, 40, 202, 0.35);
-        --verde: #00FF87;
-        --verde-claro: #B8FFD9;
-        --ciano: #00D2FF;
-        --rosa: #FF3366;
-        --ambar: #FFAA00;
-        --texto: #F3F4F6;
-        --texto-suave: #9CA3AF;
-        --radius: 16px;
-        --ease: cubic-bezier(.2, .8, .2, 1);
-    }
+html, body, [class*="css"], .stApp, button, input, textarea, select {
+    font-family: 'Plus Jakarta Sans', sans-serif !important;
+}
+.stApp {
+    background:
+        radial-gradient(circle at 0% 0%, rgba(0,200,83,.10), transparent 35%),
+        radial-gradient(circle at 100% 0%, rgba(2,132,199,.12), transparent 40%),
+        #F4F7FB !important;
+    color: __INK__ !important;
+}
+header[data-testid="stHeader"] { background: transparent !important; }
+.block-container { padding-top: 1.2rem !important; padding-bottom: 3rem !important; max-width: 1500px; }
 
-    html { scroll-behavior: smooth; }
-    html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif !important; }
-    ::selection { background: rgba(0, 255, 135, .32); color: #FFFFFF; }
+/* ---------- Sidebar ---------- */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0B132B 0%, #131E3D 100%) !important;
+    border-right: 1px solid #1C2541 !important;
+}
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span, section[data-testid="stSidebar"] h3 {
+    color: #E2E8F0 !important;
+}
+.side-brand { display:flex; align-items:center; gap:10px; padding:8px 6px 12px;
+    border-bottom:1px solid #1C2541; margin-bottom:10px; }
+.side-brand .logo { width:40px; height:40px; border-radius:12px; display:flex; align-items:center;
+    justify-content:center; background: linear-gradient(135deg,#00C853,#0284C7); font-size:1.25rem; }
+.side-brand h3 { margin:0 !important; color:#FFFFFF !important; font-weight:800; font-size:.95rem; }
+.side-brand small { color:#94A3B8 !important; font-size:.66rem; }
+.side-label { color:#00C853 !important; font-size:.66rem; font-weight:800; text-transform:uppercase;
+    letter-spacing:.08em; margin: 10px 0 4px; }
 
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(121, 40, 202, .45); border-radius: 8px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(0, 255, 135, .5); }
+/* ---------- Navegação em abas (pílulas) ---------- */
+div[data-testid="stRadio"] > div[role="radiogroup"] { gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+div[data-testid="stRadio"] > div[role="radiogroup"] > label {
+    background:#FFFFFF; border:1px solid #E2E8F0; border-radius:999px; padding:6px 16px;
+    box-shadow: 0 2px 8px -6px rgba(15,23,42,.35); cursor:pointer;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:hover { border-color:#00C853; }
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) {
+    background: linear-gradient(135deg,#00C853,#0284C7); border-color: transparent;
+    box-shadow: 0 6px 14px -6px rgba(2,132,199,.6);
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) p {
+    color:#FFFFFF !important; font-weight:700 !important;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child { display:none !important; }
 
-    /* ---------- Fundo ---------- */
-    .stApp {
-        background:
-            radial-gradient(900px circle at 8% -12%, rgba(121, 40, 202, .30), transparent 60%),
-            radial-gradient(760px circle at 105% 4%, rgba(0, 255, 135, .08), transparent 55%),
-            linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 100%) fixed !important;
-        color: var(--texto) !important;
-    }
-    header[data-testid="stHeader"] { background: transparent !important; }
-    .block-container { padding-top: 1.4rem !important; padding-bottom: 3rem !important; max-width: 1560px; }
+/* ---------- Hero ---------- */
+.hero {
+    border-radius:18px; padding:22px 26px; margin-bottom:16px;
+    background: linear-gradient(115deg,#0B132B 0%,#1C2541 45%,#0284C7 80%,#00C853 100%);
+    box-shadow: 0 18px 40px -18px rgba(2,132,199,.55);
+    display:flex; align-items:center; gap:16px;
+}
+.hero .ico { width:56px; height:56px; border-radius:16px; display:flex; align-items:center;
+    justify-content:center; font-size:1.8rem; background: rgba(255,255,255,.16);
+    border:1px solid rgba(255,255,255,.25); }
+.hero h1 { margin:0 !important; font-size:1.7rem; font-weight:800; color:#FFFFFF; letter-spacing:-.02em; }
+.hero p { margin:4px 0 0; color:rgba(255,255,255,.88); font-size:.9rem; }
 
-    /* ---------- Animações (só transform e opacity, para não pesar) ---------- */
-    @keyframes fadeUp {
-        from { opacity: 0; transform: translateY(12px); }
-        to   { opacity: 1; transform: translateY(0); }
-    }
-    @keyframes shimmer {
-        0%   { background-position: 0% 50%; }
-        100% { background-position: 200% 50%; }
-    }
-    @keyframes gradientText {
-        0%   { background-position: 0% 50%; }
-        100% { background-position: 250% 50%; }
-    }
-    @keyframes pulseDot {
-        0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 135, .65); }
-        60%      { box-shadow: 0 0 0 7px rgba(0, 255, 135, 0); }
-    }
-    @keyframes glowBox {
-        0%, 100% { box-shadow: 0 0 14px rgba(0, 255, 135, .18); }
-        50%      { box-shadow: 0 0 26px rgba(0, 255, 135, .42); }
-    }
-    @keyframes glowText {
-        0%, 100% { text-shadow: 0 0 12px rgba(0, 255, 135, .22); }
-        50%      { text-shadow: 0 0 24px rgba(0, 255, 135, .55); }
-    }
-    @keyframes driveCar {
-        0%   { transform: translateX(-120px); opacity: 0; }
-        10%  { opacity: 1; }
-        90%  { opacity: 1; }
-        100% { transform: translateX(calc(100vw + 120px)); opacity: 0; }
-    }
-    @keyframes roadMove {
-        from { background-position: 0 0; }
-        to   { background-position: 52px 0; }
-    }
+/* ---------- Títulos de seção ---------- */
+.sec { display:flex; align-items:center; gap:10px; margin: 16px 0 8px; font-weight:800;
+    color: __INK__; font-size:1.02rem; }
+.sec::before { content:""; width:4px; height:18px; border-radius:4px;
+    background: linear-gradient(180deg, #00C853, #0284C7); }
 
-    /* ---------- Sidebar ---------- */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0E0920 0%, #08050F 100%) !important;
-        border-right: 1px solid var(--roxo-soft) !important;
-    }
-    section[data-testid="stSidebar"] hr { border-color: rgba(121, 40, 202, .25) !important; margin: .9rem 0 !important; }
-    section[data-testid="stSidebar"] h3 { font-size: .95rem; font-weight: 700; color: #C4B5FD; letter-spacing: .03em; }
-    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: var(--texto-suave) !important; }
+/* ---------- Cards KPI ---------- */
+.bi-card { background:#FFFFFF; border:1px solid #E2E8F0; border-top:4px solid var(--cor, #00C853);
+    border-radius:14px; padding:16px 18px; margin-bottom:12px;
+    box-shadow: 0 6px 18px -10px rgba(15,23,42,.18); transition: transform .2s ease, box-shadow .2s ease; }
+.bi-card:hover { transform: translateY(-3px); box-shadow: 0 14px 26px -14px rgba(15,23,42,.28); }
+.bi-top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.bi-title { font-size:.68rem; font-weight:700; text-transform:uppercase; color:#64748B; letter-spacing:.06em; }
+.bi-ico { width:36px; height:36px; border-radius:11px; display:flex; align-items:center;
+    justify-content:center; font-size:1.1rem; flex-shrink:0; }
+.bi-val { font-size:1.55rem; font-weight:800; color: __INK__; margin-top:8px; line-height:1.2; word-break:break-word; }
+.bi-sub { font-size:.75rem; font-weight:600; margin-top:4px; color: var(--cor, #059669); }
 
-    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; animation: fadeUp .6s var(--ease) backwards; }
-    .brand-logo {
-        font-size: 1.45rem; line-height: 1;
-        background: rgba(0, 255, 135, .12);
-        border: 1px solid rgba(0, 255, 135, .7);
-        padding: 10px; border-radius: 12px;
-        animation: glowBox 3s ease-in-out infinite;
-    }
-    section[data-testid="stSidebar"] .brand h3 { margin: 0; color: var(--verde); font-weight: 800; font-size: 1.1rem; }
-    .brand span { font-size: .72rem; color: var(--texto-suave); letter-spacing: .06em; }
+/* ---------- Botões, tabelas, containers ---------- */
+div.stButton > button:first-child, div.stDownloadButton > button:first-child {
+    background: linear-gradient(135deg, #00C853 0%, #0284C7 100%) !important;
+    color:#FFFFFF !important; font-weight:700 !important; border:none !important;
+    border-radius:10px !important; box-shadow: 0 6px 16px -6px rgba(0,200,83,.55);
+}
+div[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; }
+div[data-testid="stExpander"] { border-radius:12px !important; background:#fff; }
+.rodape { display:flex; justify-content:space-between; align-items:center; color:#64748B;
+    font-size:.75rem; padding:6px 2px; }
+.badge-live { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+    background: rgba(0,200,83,.12); color:#047857; font-weight:700; font-size:.72rem; }
+.badge-live::before { content:""; width:8px; height:8px; border-radius:50%; background:#00C853; }
+"""
+st.markdown(f"<style>{CSS.replace('__INK__', INK)}</style>", unsafe_allow_html=True)
 
-    /* ---------- Abas ---------- */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        background: rgba(18, 13, 36, .72);
-        padding: 6px;
-        border-radius: 14px;
-        border: 1px solid var(--roxo-soft);
-        flex-wrap: wrap;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 42px;
-        background: transparent;
-        border: 1px solid transparent;
-        border-radius: 10px;
-        color: var(--texto-suave);
-        font-weight: 600;
-        padding: 0 16px;
-        transition: color .25s var(--ease), background-color .25s var(--ease), border-color .25s var(--ease), transform .25s var(--ease);
-    }
-    .stTabs [data-baseweb="tab"]:hover {
-        color: var(--verde-claro);
-        background: rgba(255, 255, 255, .04);
-        transform: translateY(-1px);
-    }
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, rgba(121, 40, 202, .45) 0%, rgba(0, 255, 135, .16) 100%) !important;
-        color: var(--verde) !important;
-        border-color: rgba(0, 255, 135, .45) !important;
-        box-shadow: 0 0 18px rgba(0, 255, 135, .18), inset 0 1px 0 rgba(255, 255, 255, .06);
-    }
-    .stTabs [data-baseweb="tab-highlight"],
-    .stTabs [data-baseweb="tab-border"] { display: none !important; }
-    .stTabs [data-baseweb="tab-panel"] { padding-top: 1.1rem; animation: fadeUp .5s var(--ease) backwards; }
-
-    /* ---------- Cabeçalho ---------- */
-    .hero-title {
-        margin: 0; font-size: 2.0rem; font-weight: 800; color: #FFFFFF;
-        line-height: 1.15; letter-spacing: -.02em;
-        animation: fadeUp .6s var(--ease) backwards;
-    }
-    .hero-title .hl {
-        background: linear-gradient(90deg, var(--verde) 0%, var(--ciano) 35%, var(--verde) 60%, var(--roxo-claro) 100%);
-        background-size: 250% auto;
-        -webkit-background-clip: text;
-        background-clip: text;
-        -webkit-text-fill-color: transparent;
-        color: transparent;
-        animation: gradientText 7s linear infinite;
-    }
-    .hero-sub { color: var(--texto-suave); margin: 4px 0 0; font-size: .9rem; animation: fadeUp .7s var(--ease) backwards; }
-    .frota-badge {
-        text-align: right;
-        background: linear-gradient(145deg, rgba(31, 22, 58, .8) 0%, rgba(14, 10, 28, .9) 100%);
-        padding: 10px 16px;
-        border-radius: 14px;
-        border: 1px solid var(--roxo-soft);
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
-        animation: fadeUp .6s var(--ease) backwards;
-    }
-    .badge-label { font-size: .68rem; color: var(--texto-suave); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-    .badge-val { font-size: 1.15rem; font-weight: 800; color: var(--verde); margin-top: 2px; }
-    .frota-dot {
-        display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-        background: var(--verde); margin-right: 8px; vertical-align: middle;
-        animation: pulseDot 2s infinite;
-    }
-
-    /* ---------- Cards KPI ---------- */
-    .pbi-card {
-        position: relative;
-        overflow: hidden;
-        isolation: isolate;
-        background: linear-gradient(145deg, rgba(31, 22, 58, .9) 0%, rgba(14, 10, 28, .96) 100%);
-        border: 1px solid var(--roxo-soft);
-        border-radius: var(--radius);
-        padding: 18px 18px 16px;
-        margin-bottom: 12px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, .45), inset 0 1px 0 rgba(255, 255, 255, .05);
-        transition: transform .35s var(--ease), border-color .35s var(--ease), box-shadow .35s var(--ease);
-        animation: fadeUp .6s var(--ease) backwards;
-    }
-    .pbi-card:hover {
-        transform: translateY(-4px);
-        border-color: rgba(0, 255, 135, .55);
-        box-shadow: 0 16px 40px rgba(0, 255, 135, .16), inset 0 1px 0 rgba(255, 255, 255, .06);
-    }
-    .pbi-glow { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
-    .pbi-card-border-top {
-        position: absolute; top: 0; left: 0; right: 0; height: 3px;
-        background-size: 200% 100%;
-        animation: shimmer 4s linear infinite;
-    }
-    .pbi-card-title {
-        font-size: .72rem; font-weight: 700; text-transform: uppercase;
-        letter-spacing: .07em; color: var(--texto-suave); margin-bottom: 8px;
-    }
-    .info-dot { opacity: .5; font-size: .75rem; }
-    .pbi-card-val {
-        font-size: 1.75rem; font-weight: 800; color: #FFFFFF; line-height: 1.1;
-        letter-spacing: -.01em; font-variant-numeric: tabular-nums; word-break: break-word;
-    }
-    .pbi-card-footer {
-        display: flex; align-items: center; gap: 7px;
-        font-size: .75rem; font-weight: 600; margin-top: 8px;
-    }
-    .pbi-card-footer::before {
-        content: ""; flex: 0 0 6px; width: 6px; height: 6px; border-radius: 50%;
-        background: currentColor; box-shadow: 0 0 8px currentColor;
-    }
-
-    /* Entrada em cascata dos cards KPI */
-    div[data-testid="stHorizontalBlock"] > div:nth-child(2) .pbi-card { animation-delay: .06s; }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(3) .pbi-card { animation-delay: .12s; }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(4) .pbi-card { animation-delay: .18s; }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(5) .pbi-card { animation-delay: .24s; }
-    div[data-testid="stHorizontalBlock"] > div:nth-child(6) .pbi-card { animation-delay: .30s; }
-
-    /* ---------- Caixas de decisão ---------- */
-    .decision-box {
-        background: linear-gradient(135deg, rgba(26, 18, 51, .85) 0%, rgba(14, 10, 28, .9) 100%);
-        border: 1px solid rgba(255, 255, 255, .06);
-        border-left: 4px solid var(--verde);
-        border-radius: 12px;
-        padding: 16px 20px;
-        margin-bottom: 14px;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
-        transition: transform .3s var(--ease), box-shadow .3s var(--ease);
-        animation: fadeUp .5s var(--ease) backwards;
-    }
-    .decision-box:hover { transform: translateX(3px); box-shadow: 0 14px 34px rgba(0, 255, 135, .12); }
-    .decision-box.critical {
-        border-left-color: var(--rosa);
-        background: linear-gradient(135deg, rgba(43, 14, 28, .75) 0%, rgba(14, 10, 28, .9) 100%);
-    }
-    .decision-box.critical:hover { box-shadow: 0 14px 34px rgba(255, 51, 102, .15); }
-
-    /* ---------- Botões ---------- */
-    .stButton > button, .stDownloadButton > button {
-        background: linear-gradient(135deg, var(--verde) 0%, var(--ciano) 100%) !important;
-        color: #06050a !important;
-        font-weight: 800 !important;
-        letter-spacing: .01em;
-        border: none !important;
-        border-radius: 12px !important;
-        padding: .6rem 1.3rem !important;
-        box-shadow: 0 6px 20px rgba(0, 255, 135, .22);
-        transition: transform .2s var(--ease), box-shadow .3s var(--ease), filter .2s !important;
-    }
-    .stButton > button:hover, .stDownloadButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 10px 28px rgba(0, 255, 135, .38) !important;
-        filter: brightness(1.05);
-    }
-    .stButton > button:active, .stDownloadButton > button:active { transform: translateY(0) scale(.99); }
-
-    /* ---------- Campos de entrada e seleção ---------- */
-    div[data-baseweb="input"],
-    div[data-baseweb="select"] > div {
-        background-color: rgba(14, 10, 28, .8) !important;
-        border-color: rgba(121, 40, 202, .4) !important;
-        border-radius: 10px !important;
-        transition: border-color .2s, box-shadow .2s;
-    }
-    div[data-baseweb="input"]:focus-within,
-    div[data-baseweb="select"] > div:focus-within {
-        border-color: var(--verde) !important;
-        box-shadow: 0 0 0 3px rgba(0, 255, 135, .15) !important;
-    }
-    span[data-baseweb="tag"] { background: rgba(121, 40, 202, .35) !important; border-radius: 8px !important; }
-
-    /* ---------- Tabelas e gráficos ---------- */
-    div[data-testid="stDataFrame"] {
-        border: 1px solid var(--roxo-soft);
-        border-radius: 14px;
-        overflow: hidden;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
-    }
-    div[data-testid="stPlotlyChart"] {
-        background: linear-gradient(145deg, rgba(25, 19, 48, .55) 0%, rgba(12, 9, 24, .72) 100%);
-        border: 1px solid rgba(121, 40, 202, .22);
-        border-radius: var(--radius);
-        padding: 10px 10px 4px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, .3);
-        animation: fadeUp .6s var(--ease) backwards;
-    }
-    div[data-testid="stAlertContainer"] { border-radius: 12px; }
-
-    /* ---------- Títulos de seção ---------- */
-    h1, h2, h3 { letter-spacing: -.01em; }
-    [data-testid="stMarkdownContainer"] h5 {
-        color: #E5E7EB; font-weight: 700; font-size: 1rem;
-        margin: .6rem 0 .5rem; padding-left: 12px;
-        border-left: 3px solid var(--verde);
-    }
-
-    /* ---------- Login ---------- */
-    .login-marker { display: none; }
-    .login-hero { text-align: center; margin: 36px 0 22px; animation: fadeUp .8s var(--ease) backwards; }
-    .login-hero h1 { font-size: 2.9rem; font-weight: 800; color: #FFFFFF; margin: 0; letter-spacing: -.02em; }
-    .login-hero h1 span { color: var(--verde); animation: glowText 3.5s ease-in-out infinite; }
-    .login-hero p { color: var(--texto-suave); font-size: 1.05rem; margin: 8px 0 0; }
-    .login-hero .linha {
-        width: 140px; height: 2px; margin: 16px auto 0;
-        background: linear-gradient(90deg, transparent, var(--verde), transparent);
-    }
-    .login-title { color: var(--verde); text-align: center; margin: 4px 0 18px; font-size: 1.3rem; font-weight: 800; }
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(.login-marker) {
-        background: rgba(25, 19, 48, .88) !important;
-        border: 1px solid rgba(121, 40, 202, .45) !important;
-        border-radius: 20px !important;
-        padding: 28px !important;
-        box-shadow: 0 24px 70px rgba(0, 0, 0, .55), 0 0 50px rgba(121, 40, 202, .18);
-        animation: fadeUp .8s var(--ease) backwards;
-    }
-
-    /* ---------- Estrada do login ---------- */
-    .road-strip { position: relative; height: 110px; overflow: hidden; width: 100%; margin-top: 48px; }
-    .road-strip::after {
-        content: ""; position: absolute; left: 0; right: 0; bottom: 18px; height: 2px;
-        background: repeating-linear-gradient(90deg, rgba(0, 255, 135, .45) 0 26px, transparent 26px 52px);
-        background-size: 52px 2px;
-        animation: roadMove 1.1s linear infinite;
-    }
-    .animated-car-1, .animated-car-2 {
-        position: absolute; z-index: 1;
-        filter: drop-shadow(0 0 10px rgba(0, 255, 135, .25));
-    }
-    .animated-car-1 { bottom: 26px; font-size: 2.6rem; animation: driveCar 7s linear infinite; }
-    .animated-car-2 { bottom: 72px; font-size: 2.1rem; animation: driveCar 11s linear infinite 3s; }
-
-    /* ---------- Rodapé ---------- */
-    .footer-bar {
-        display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; align-items: center;
-        color: #6B7280; font-size: .8rem; padding: 10px 0;
-    }
-    .footer-bar b { color: var(--texto-suave); }
-
-    /* ---------- Responsivo ---------- */
-    @media (max-width: 1280px) {
-        .pbi-card-val { font-size: 1.5rem; }
-    }
-    @media (max-width: 900px) {
-        .block-container { padding: 1rem .9rem 3rem !important; }
-        div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: .75rem !important; }
-        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
-        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-            flex: 1 1 calc(50% - .75rem) !important;
-            min-width: calc(50% - .75rem) !important;
-            width: auto !important;
-        }
-        .hero-title { font-size: 1.6rem; }
-        .frota-badge { text-align: left; }
-        .stTabs [data-baseweb="tab-list"] { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
-        .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
-        .stTabs [data-baseweb="tab"] { flex: 0 0 auto; padding: 0 12px; font-size: .85rem; }
-        .login-hero h1 { font-size: 2.2rem; }
-
-        div[data-testid="stHorizontalBlock"]:has(.login-marker) > div[data-testid="stColumn"]:not(:has(.login-marker)),
-        div[data-testid="stHorizontalBlock"]:has(.login-marker) > div[data-testid="column"]:not(:has(.login-marker)) {
-            display: none !important;
-        }
-        div[data-testid="stColumn"]:has(.login-marker),
-        div[data-testid="column"]:has(.login-marker) {
-            flex: 1 1 100% !important;
-            min-width: 100% !important;
-        }
-    }
-    @media (max-width: 560px) {
-        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
-        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-            flex: 1 1 100% !important;
-            min-width: 100% !important;
-        }
-        .hero-title { font-size: 1.35rem; }
-        .pbi-card-val { font-size: 1.35rem; }
-        .login-hero h1 { font-size: 1.9rem; }
-        .stTabs [data-baseweb="tab"] { padding: 0 10px; }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-        *, *::before, *::after {
-            animation-duration: .01ms !important;
-            animation-iteration-count: 1 !important;
-            transition-duration: .01ms !important;
-            scroll-behavior: auto !important;
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # ==============================================================================
-# 3. TELA DE LOGIN
+# 5. FUNÇÕES DE SUPORTE VISUAL
 # ==============================================================================
-if not st.session_state["autenticado"]:
-    st.markdown("""
-<div class="login-hero">
-  <h1>GESTOR <span>CEABS</span></h1>
-  <p>API Complementar & Telemetria Operacional</p>
-  <div class="linha"></div>
-</div>""", unsafe_allow_html=True)
+def hero(icone, titulo, subtitulo):
+    st.markdown(
+        f'<div class="hero"><div class="ico">{icone}</div><div>'
+        f'<h1>{titulo}</h1><p>{subtitulo}</p></div></div>',
+        unsafe_allow_html=True,
+    )
 
-    col_l1, col_l_centro, col_l3 = st.columns([1, 1.2, 1])
-    with col_l_centro:
-        with st.container(border=True):
-            st.markdown("<div class='login-marker'></div><h3 class='login-title'>🔐 Autenticação Segura</h3>", unsafe_allow_html=True)
-            usuario_input = st.text_input("Usuário", placeholder="Paulo, Ocimar ou Marcelo")
-            senha_input = st.text_input("Senha", type="password", placeholder="Senha de acesso")
 
-            if st.button("Acessar Cockpit", use_container_width=True):
-                if usuario_input in USUARIOS_VALIDOS and USUARIOS_VALIDOS[usuario_input] == senha_input:
-                    st.session_state["autenticado"] = True
-                    st.session_state["usuario_atual"] = usuario_input
-                    st.success("Sessão inicializada!")
-                    st.rerun()
-                else:
-                    st.error("Credenciais inválidas.")
+def sec(titulo):
+    st.markdown(f'<div class="sec">{titulo}</div>', unsafe_allow_html=True)
 
-    st.markdown("""
-<div class="road-strip">
-  <div class="animated-car-1">🚛💨</div>
-  <div class="animated-car-2">🚗⚡</div>
-</div>""", unsafe_allow_html=True)
-    st.stop()
+
+def render_bi_card(col, titulo, valor, desc, cor=VERDE, icone="📊", delay=0):
+    col.markdown(
+        f'<div class="bi-card" style="--cor:{cor}; animation-delay:{delay}ms;">'
+        f'<div class="bi-top"><span class="bi-title">{titulo}</span>'
+        f'<span class="bi-ico" style="background:{cor}22;">{icone}</span></div>'
+        f'<div class="bi-val">{valor}</div>'
+        f'<div class="bi-sub">{desc}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def aplicar_tema(fig, height=300, legenda=False):
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Plus Jakarta Sans, sans-serif", color="#334155"),
+        colorway=CORES,
+        margin=dict(l=10, r=10, t=20, b=10),
+        height=height,
+        showlegend=legenda,
+        hoverlabel=dict(bgcolor="#FFFFFF", font=dict(color=INK)),
+        xaxis=dict(gridcolor="#E2E8F0", zeroline=False),
+        yaxis=dict(gridcolor="#E2E8F0", zeroline=False),
+    )
+    return fig
+
+
+def mostrar_grafico(fig):
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def mostrar_mapa(fig):
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+
 
 # ==============================================================================
-# 4. CARGA DE DADOS DO BANCO SQLITE
+# 6. LEITURA E PREPARAÇÃO DOS DADOS
 # ==============================================================================
-def conectar_bd():
-    return sqlite3.connect(BANCO)
+def _col(df, nome, padrao=None):
+    """Retorna a coluna se existir; senão, uma série com o valor padrão."""
+    if nome in df.columns:
+        return df[nome]
+    return pd.Series(padrao, index=df.index)
 
-@st.cache_data(ttl=60)
-def carregar_bases_supremas():
-    if not os.path.exists(BANCO):
-        placas = [f"ABC-{1000 + i}" for i in range(1, 25)]
-        df_safe = pd.DataFrame({
-            "id": [f"EVT-{i}" for i in range(150)],
-            "placa": np.random.choice(placas, 150),
-            "descricao": np.random.choice(["Distração ao Volante", "Uso de Celular", "Sonolência / Fadiga", "Cigarro"], 150),
-            "categoria_nome": np.random.choice(["Distração", "Celular", "Fadiga", "Cigarro"], 150),
-            "nivel_risco": np.random.choice(["Crítico", "Alto", "Médio"], 150),
-            "velocidade": np.random.randint(40, 110, 150),
-            "latitude": -23.55 + np.random.normal(0, 0.05, 150),
-            "longitude": -46.63 + np.random.normal(0, 0.05, 150),
-            "dt_evento": [datetime.now() - timedelta(days=np.random.randint(0, 30)) for _ in range(150)]
-        })
-        cps_pos = pd.DataFrame({
-            "placa": placas,
-            "latitude": -23.55 + np.random.normal(0, 0.05, len(placas)),
-            "longitude": -46.63 + np.random.normal(0, 0.05, len(placas)),
-            "velocidade": np.random.randint(0, 85, len(placas)),
-            "ignicao": np.random.choice([0, 1], len(placas)),
-            "odometro": np.random.randint(40000, 95000, len(placas)),
-            "municipio": "Paulínia",
-            "uf": "SP"
-        })
-        cps_infracoes = pd.DataFrame({
-            "placa": np.random.choice(placas, 40),
-            "infracao_tipo_id": np.random.choice(list(MAPA_INFRACOES_CPS.keys()), 40),
-            "velocidade": np.random.randint(85, 130, 40),
-            "latitude_inicio": -23.55 + np.random.normal(0, 0.05, 40),
-            "longitude_inicio": -46.63 + np.random.normal(0, 0.05, 40),
-            "cidade": "Campinas",
-            "estado": "SP",
-            "inicio": [datetime.now() - timedelta(days=np.random.randint(0, 30)) for _ in range(40)]
-        })
-        cps_viagens = pd.DataFrame({
-            "placa": np.random.choice(placas, 120),
-            "distancia_km": np.random.uniform(5, 150, 120),
-            "inicio": [datetime.now() - timedelta(days=np.random.randint(0, 30)) for _ in range(120)]
-        })
-        return df_safe, cps_pos, cps_infracoes, cps_viagens
 
-    conn = conectar_bd()
+def to_dt(serie):
+    """Converte datas aceitando formatos mistos (ISO, dd/mm/aaaa, com ou sem hora)."""
     try:
-        safe_alarmes = pd.read_sql("""
-            SELECT a.*, t.descricao, t.categoria_nome, t.severidade as nivel_risco
+        return pd.to_datetime(serie, errors="coerce", format="mixed", dayfirst=True)
+    except (TypeError, ValueError):
+        return pd.to_datetime(serie, errors="coerce", dayfirst=True)
+
+
+def to_num(serie):
+    """Converte para número, tratando vírgula decimal guardada como texto."""
+    num = pd.to_numeric(serie, errors="coerce")
+    if num.isna().all() and serie.notna().any():
+        num = pd.to_numeric(serie.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    return num
+
+
+def _sem_duplicadas(df):
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
+def _preparar(safe, pos, inf, vig):
+    if not safe.empty:
+        safe = _sem_duplicadas(safe)
+        safe["latitude"] = to_num(_col(safe, "latitude"))
+        safe["longitude"] = to_num(_col(safe, "longitude"))
+        safe["dt_evento"] = to_dt(_col(safe, "data_hora")) - pd.Timedelta(hours=3)
+        safe["nivel_risco"] = _col(safe, "nivel_risco", "Médio").fillna("Médio").astype(str)
+        safe["velocidade"] = to_num(_col(safe, "velocidade", 0)).fillna(0).astype(int)
+
+    if not pos.empty:
+        pos = _sem_duplicadas(pos)
+        pos["latitude"] = to_num(_col(pos, "latitude"))
+        pos["longitude"] = to_num(_col(pos, "longitude"))
+        pos["odometro"] = to_num(_col(pos, "odometro", 0)).fillna(0)
+        pos["velocidade"] = to_num(_col(pos, "velocidade", 0)).fillna(0)
+        pos["ignicao"] = to_num(_col(pos, "ignicao", 0)).fillna(0)
+
+    if not inf.empty:
+        inf = _sem_duplicadas(inf)
+        inf["latitude"] = to_num(_col(inf, "latitude_inicio"))
+        inf["longitude"] = to_num(_col(inf, "longitude_inicio"))
+        fonte_dt = "inicio" if "inicio" in inf.columns else "data_carga"
+        inf["dt_evento"] = to_dt(_col(inf, fonte_dt)) - pd.Timedelta(hours=3)
+
+        if "infracao_tipo_id" in inf.columns:
+            codigos = to_num(inf["infracao_tipo_id"])
+            mapeada = codigos.map(
+                lambda v: MAPA_INFRACOES_CPS.get(int(v)) if pd.notna(v) else None
+            )
+            inf["descricao_original"] = mapeada.fillna("Infração Operacional CPS")
+        elif "descricao" in inf.columns:
+            inf["descricao_original"] = inf["descricao"].fillna("Infração Operacional CPS").astype(str)
+        else:
+            inf["descricao_original"] = "Infração Operacional CPS"
+
+        inf["descricao"] = np.where(
+            inf["descricao_original"].str.contains("Velocidade", case=False, na=False),
+            "Excesso de Velocidade",
+            inf["descricao_original"],
+        )
+        inf["velocidade"] = to_num(_col(inf, "velocidade", 0)).fillna(0)
+        inf["motorista"] = _col(inf, "motorista", "Não Identificado").fillna("Não Identificado").astype(str)
+
+    if not vig.empty:
+        vig = _sem_duplicadas(vig)
+        fonte_dt = "inicio" if "inicio" in vig.columns else "data_carga"
+        vig["dt_viagem"] = to_dt(_col(vig, fonte_dt)) - pd.Timedelta(hours=3)
+        vig["distancia_km"] = to_num(_col(vig, "distancia_km", 0)).fillna(0)
+
+    return safe, pos, inf, vig
+
+
+@st.cache_data(ttl=60, show_spinner="Carregando dados da base...")
+def carregar_dados():
+    """Lê as tabelas uma única vez por minuto e devolve também os erros encontrados."""
+    if not os.path.exists(BANCO):
+        return {}, [f"Banco não encontrado em: {BANCO}"]
+
+    erros = []
+    try:
+        conn = sqlite3.connect(BANCO)
+    except Exception as e:
+        return {}, [f"Falha ao abrir o banco: {e}"]
+
+    consultas = {
+        "safe": """
+            SELECT a.*, t.descricao, t.categoria_nome, t.severidade AS nivel_risco
             FROM tb_safe_alarmes a
             LEFT JOIN tb_safe_tipos_alarme t ON a.codigo_alarme = t.codigo_alarme
-        """, conn)
-    except Exception:
-        safe_alarmes = pd.DataFrame()
-
-    try:
-        cps_pos = pd.read_sql("SELECT * FROM tb_cps_ultima_posicao", conn)
-    except Exception:
-        cps_pos = pd.DataFrame()
-
-    try:
-        cps_infracoes = pd.read_sql("SELECT * FROM tb_cps_infracoes", conn)
-    except Exception:
-        cps_infracoes = pd.DataFrame()
-
-    try:
-        cps_viagens = pd.read_sql("SELECT * FROM tb_cps_viagens", conn)
-    except Exception:
-        cps_viagens = pd.DataFrame()
-
+        """,
+        "pos": "SELECT * FROM tb_cps_ultima_posicao",
+        "inf": "SELECT * FROM tb_cps_infracoes",
+        "vig": "SELECT * FROM tb_cps_viagens",
+    }
+    tabelas = {}
+    for nome, sql in consultas.items():
+        try:
+            tabelas[nome] = pd.read_sql(sql, conn)
+        except Exception as e:
+            tabelas[nome] = pd.DataFrame()
+            erros.append(f"Tabela '{nome}' não lida: {e}")
     conn.close()
 
-    if not safe_alarmes.empty:
-        safe_alarmes = safe_alarmes.loc[:, ~safe_alarmes.columns.duplicated()]
-        safe_alarmes["latitude"] = pd.to_numeric(safe_alarmes.get("latitude"), errors="coerce")
-        safe_alarmes["longitude"] = pd.to_numeric(safe_alarmes.get("longitude"), errors="coerce")
-        safe_alarmes["dt_evento"] = pd.to_datetime(safe_alarmes.get("data_hora"), errors="coerce")
-        safe_alarmes["nivel_risco"] = safe_alarmes.get("nivel_risco", "Médio").fillna("Médio").astype(str)
-        safe_alarmes["velocidade"] = pd.to_numeric(safe_alarmes.get("velocidade"), errors="coerce").fillna(0).astype(int)
+    safe, pos, inf, vig = _preparar(tabelas["safe"], tabelas["pos"], tabelas["inf"], tabelas["vig"])
+    return {"safe": safe, "pos": pos, "inf": inf, "vig": vig}, erros
 
-    if not cps_pos.empty:
-        cps_pos = cps_pos.loc[:, ~cps_pos.columns.duplicated()]
-        cps_pos["latitude"] = pd.to_numeric(cps_pos.get("latitude"), errors="coerce")
-        cps_pos["longitude"] = pd.to_numeric(cps_pos.get("longitude"), errors="coerce")
-        cps_pos["odometro"] = pd.to_numeric(cps_pos.get("odometro"), errors="coerce").fillna(0)
-        cps_pos["velocidade"] = pd.to_numeric(cps_pos.get("velocidade"), errors="coerce").fillna(0)
 
-    if not cps_infracoes.empty:
-        cps_infracoes = cps_infracoes.loc[:, ~cps_infracoes.columns.duplicated()]
-        if "latitude_inicio" in cps_infracoes.columns:
-            cps_infracoes["latitude"] = pd.to_numeric(cps_infracoes.get("latitude_inicio"), errors="coerce")
-            cps_infracoes["longitude"] = pd.to_numeric(cps_infracoes.get("longitude_inicio"), errors="coerce")
-        if "inicio" in cps_infracoes.columns:
-            cps_infracoes["dt_evento"] = pd.to_datetime(cps_infracoes.get("inicio"), errors="coerce")
-        elif "data_carga" in cps_infracoes.columns:
-            cps_infracoes["dt_evento"] = pd.to_datetime(cps_infracoes.get("data_carga"), errors="coerce")
+def disparar_etl():
+    scripts = [
+        "carga_tipos_safe.py", "carga_safe.py", "carga_veiculos_safe.py",
+        "carga_cps_ultima_posicao.py", "carga_cps_infracoes.py",
+        "carga_cps_viagens.py", "carga_cps_eventos_geo.py",
+    ]
+    log_execucao = ""
+    try:
+        for script in scripts:
+            caminho = os.path.join(PASTA_PROJETO, script)
+            if not os.path.exists(caminho):
+                log_execucao += f"\n===== {script}: arquivo não encontrado =====\n"
+                continue
+            resultado = subprocess.run(
+                [sys.executable, caminho], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", cwd=PASTA_PROJETO, timeout=1800,
+            )
+            if resultado.stdout:
+                log_execucao += f"\n===== {script} =====\n{resultado.stdout}"
+            if resultado.stderr:
+                log_execucao += f"\n===== ERRO {script} =====\n{resultado.stderr}"
+        st.session_state["ultimo_sync"] = datetime.now()
+        st.cache_data.clear()
+        return True, log_execucao
+    except Exception as erro:
+        return False, str(erro)
 
-        if "infracao_tipo_id" in cps_infracoes.columns:
-            cps_infracoes["descricao"] = cps_infracoes["infracao_tipo_id"].map(MAPA_INFRACOES_CPS).fillna("Infração Operacional CPS")
-        elif "descricao" not in cps_infracoes.columns:
-            cps_infracoes["descricao"] = "Infração Operacional CPS"
 
-        if "velocidade" in cps_infracoes.columns:
-            cps_infracoes["velocidade"] = pd.to_numeric(cps_infracoes["velocidade"], errors="coerce").fillna(0)
-
-    if not cps_viagens.empty:
-        cps_viagens = cps_viagens.loc[:, ~cps_viagens.columns.duplicated()]
-        if "inicio" in cps_viagens.columns:
-            cps_viagens["dt_viagem"] = pd.to_datetime(cps_viagens.get("inicio"), errors="coerce")
-        elif "data_carga" in cps_viagens.columns:
-            cps_viagens["dt_viagem"] = pd.to_datetime(cps_viagens.get("data_carga"), errors="coerce")
-        if "distancia_km" in cps_viagens.columns:
-            cps_viagens["distancia_km"] = pd.to_numeric(cps_viagens["distancia_km"], errors="coerce").fillna(0)
-
-    return safe_alarmes, cps_pos, cps_infracoes, cps_viagens
-
-df_safe, cps_pos, cps_infracoes, cps_viagens = carregar_bases_supremas()
-
-# ==============================================================================
-# 5. SIDEBAR & CONTROLE DE ATUALIZAÇÃO
-# ==============================================================================
 if "ultimo_sync" not in st.session_state:
     st.session_state["ultimo_sync"] = datetime.now()
 
-def disparar_etl():
-    try:
-        dir_b = os.path.dirname(BANCO)
-        sc = os.path.join(dir_b, "executar_tudo.py")
-        if not os.path.exists(sc): sc = "executar_tudo.py"
-        res = subprocess.run([sys.executable, sc], capture_output=True, text=True, timeout=180, cwd=dir_b if os.path.exists(dir_b) else None)
-        if res.returncode != 0: return False, res.stderr
-        st.session_state["ultimo_sync"] = datetime.now()
-        st.cache_data.clear()
-        return True, res.stdout
-    except Exception as e:
-        return False, str(e)
+dados, erros_leitura = carregar_dados()
+df_safe = dados.get("safe", pd.DataFrame())
+cps_pos = dados.get("pos", pd.DataFrame())
+cps_infracoes = dados.get("inf", pd.DataFrame())
+cps_viagens = dados.get("vig", pd.DataFrame())
 
+# ==============================================================================
+# 7. BARRA LATERAL (FILTROS GLOBAIS E DIAGNÓSTICO)
+# ==============================================================================
 with st.sidebar:
-    st.markdown(f"""
-<div class="brand">
-  <div class="brand-logo">🚛</div>
-  <div>
-    <h3>GESTOR CEABS</h3>
-    <span>OPERADOR: {st.session_state['usuario_atual'].upper()}</span>
-  </div>
-</div>""", unsafe_allow_html=True)
+    st.markdown(
+        '<div class="side-brand"><div class="logo">📊</div><div>'
+        '<h3>EXECUTIVE COCKPIT</h3><small>Gestor CEABS • Frota em tempo real</small>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<p class="side-label">Filtros globais</p>', unsafe_allow_html=True)
 
-    if st.button("🚪 Sair (Logout)", use_container_width=True):
-        st.session_state["autenticado"] = False
-        st.session_state["usuario_atual"] = ""
-        st.rerun()
-
-    st.markdown("---")
-
-    st.subheader("🖥️ Seleção de Painel")
-    painel_modo = st.selectbox(
-        "Escolha a Visão Executiva",
-        [
-            "Visão unificada e EPK de ambos",
-            "Painel Gestor Dashcams e IA",
-            "Painel CPS (Telemetria Operacional)"
-        ]
+    tipo_periodo = st.selectbox(
+        "Período",
+        ["Personalizado", "Últimos 7 dias", "Últimos 14 dias", "Últimos 21 dias", "Últimos 30 dias"],
     )
 
-    st.markdown("---")
-    if st.button("🔄 Sincronizar ETL Agora", use_container_width=True):
-        with st.spinner("Atualizando dados da API..."):
-            ok, msg = disparar_etl()
-            if ok: st.success("Sincronizado com sucesso!")
-            else: st.error(f"Erro: {msg}")
-        st.rerun()
+    datas_disponiveis = []
+    for df_, col_ in [(df_safe, "dt_evento"), (cps_infracoes, "dt_evento"), (cps_viagens, "dt_viagem")]:
+        if not df_.empty and col_ in df_.columns:
+            datas_disponiveis.extend(df_[col_].dropna().dt.date.tolist())
 
-    st.caption(f"⏱️ Última Sincronização: {st.session_state['ultimo_sync'].strftime('%H:%M:%S')}")
-
-    st.markdown("---")
-    st.subheader("📅 Filtro de Período (Data)")
-
-    all_dates = []
-    if not df_safe.empty and "dt_evento" in df_safe.columns:
-        all_dates.extend(df_safe["dt_evento"].dropna().dt.date.tolist())
-    if not cps_infracoes.empty and "dt_evento" in cps_infracoes.columns:
-        all_dates.extend(cps_infracoes["dt_evento"].dropna().dt.date.tolist())
-    if not cps_viagens.empty and "dt_viagem" in cps_viagens.columns:
-        all_dates.extend(cps_viagens["dt_viagem"].dropna().dt.date.tolist())
-
-    if all_dates:
-        d_min, d_max = min(all_dates), max(all_dates)
-        data_sel = st.date_input("Intervalo", value=(d_min, d_max) if d_min != d_max else d_min, min_value=d_min, max_value=d_max)
+    if datas_disponiveis:
+        d_min, d_max = min(datas_disponiveis), max(datas_disponiveis)
+        dias_atras = {"Últimos 7 dias": 7, "Últimos 14 dias": 14, "Últimos 21 dias": 21, "Últimos 30 dias": 30}
+        if tipo_periodo in dias_atras:
+            data_sel = (d_max - timedelta(days=dias_atras[tipo_periodo]), d_max)
+        else:
+            data_sel = st.date_input(
+                "Datas",
+                value=(d_min, d_max) if d_min != d_max else d_min,
+                min_value=d_min, max_value=d_max,
+            )
     else:
         data_sel = None
 
-    st.subheader("🔍 Filtros de Frota")
+    placas_disp = sorted({
+        p for df_ in (df_safe, cps_pos, cps_infracoes) if not df_.empty and "placa" in df_.columns
+        for p in df_["placa"].dropna().unique().tolist()
+    })
+    placas_sel = st.multiselect("Veículos (placas)", placas_disp, placeholder="Todas as placas")
 
-    placas_list_safe = df_safe["placa"].dropna().unique().tolist() if not df_safe.empty and "placa" in df_safe.columns else []
-    placas_list_pos = cps_pos["placa"].dropna().unique().tolist() if not cps_pos.empty and "placa" in cps_pos.columns else []
-    placas_list_inf = cps_infracoes["placa"].dropna().unique().tolist() if not cps_infracoes.empty and "placa" in cps_infracoes.columns else []
+    st.markdown("<hr style='margin:10px 0; border-color:#1C2541;'>", unsafe_allow_html=True)
+    if st.button("🔄 Sincronizar ETL agora", use_container_width=True):
+        with st.spinner("Executando ETL..."):
+            ok, msg = disparar_etl()
+        if ok:
+            st.success("Sincronizado!")
+        else:
+            st.error(f"Falha no ETL: {msg}")
+        st.rerun()
+    st.caption(f"⏱️ Última sync: {st.session_state['ultimo_sync']:%H:%M:%S}")
 
-    placas_disp = sorted(list(set(placas_list_safe + placas_list_pos + placas_list_inf)))
-    placas_sel = st.multiselect("Veículos / Placas", placas_disp, placeholder="Todos os veículos")
+    with st.expander("🩺 Diagnóstico dos dados"):
+        st.write(f"Alarmes Safe: **{len(df_safe)}**")
+        st.write(f"Posições CPS: **{len(cps_pos)}**")
+        st.write(f"Infrações CPS: **{len(cps_infracoes)}**")
+        st.write(f"Viagens CPS: **{len(cps_viagens)}**")
+        for erro in erros_leitura:
+            st.warning(erro)
+        if not erros_leitura and len(df_safe) + len(cps_infracoes) + len(cps_viagens) == 0:
+            st.info("Nenhum registro encontrado. Confira o caminho do banco e execute o ETL.")
 
 # ==============================================================================
-# 6. FILTRAGEM E CÁLCULO DE KM POR EVENTO
+# 8. FILTRAGEM (PERÍODO E PLACAS)
 # ==============================================================================
-df_s = df_safe.copy()
-cps_inf_f = cps_infracoes.copy()
-cps_vig_f = cps_viagens.copy()
+periodo_ok = isinstance(data_sel, (tuple, list)) and len(data_sel) == 2
+if periodo_ok:
+    ini_ts = pd.Timestamp(data_sel[0])
+    fim_ts = pd.Timestamp(data_sel[1]) + pd.Timedelta(days=1)
 
-if data_sel:
-    if isinstance(data_sel, (tuple, list)) and len(data_sel) == 2:
-        if not df_s.empty and "dt_evento" in df_s.columns:
-            df_s = df_s[(df_s["dt_evento"].dt.date >= data_sel[0]) & (df_s["dt_evento"].dt.date <= data_sel[1])]
-        if not cps_inf_f.empty and "dt_evento" in cps_inf_f.columns:
-            cps_inf_f = cps_inf_f[(cps_inf_f["dt_evento"].dt.date >= data_sel[0]) & (cps_inf_f["dt_evento"].dt.date <= data_sel[1])]
-        if not cps_vig_f.empty and "dt_viagem" in cps_vig_f.columns:
-            cps_vig_f = cps_vig_f[(cps_vig_f["dt_viagem"].dt.date >= data_sel[0]) & (cps_vig_f["dt_viagem"].dt.date <= data_sel[1])]
-    elif not isinstance(data_sel, (tuple, list)):
-        if not df_s.empty and "dt_evento" in df_s.columns:
-            df_s = df_s[df_s["dt_evento"].dt.date == data_sel]
-        if not cps_inf_f.empty and "dt_evento" in cps_inf_f.columns:
-            cps_inf_f = cps_inf_f[cps_inf_f["dt_evento"].dt.date == data_sel]
-        if not cps_vig_f.empty and "dt_viagem" in cps_vig_f.columns:
-            cps_vig_f = cps_vig_f[cps_vig_f["dt_viagem"].dt.date == data_sel]
 
-if placas_sel:
-    if not df_s.empty and "placa" in df_s.columns: df_s = df_s[df_s["placa"].isin(placas_sel)]
-    if not cps_pos.empty and "placa" in cps_pos.columns: cps_pos_f = cps_pos[cps_pos["placa"].isin(placas_sel)]
-    else: cps_pos_f = pd.DataFrame()
-    if not cps_inf_f.empty and "placa" in cps_inf_f.columns: cps_inf_f = cps_inf_f[cps_inf_f["placa"].isin(placas_sel)]
-    if not cps_vig_f.empty and "placa" in cps_vig_f.columns: cps_vig_f = cps_vig_f[cps_vig_f["placa"].isin(placas_sel)]
-else:
-    cps_pos_f = cps_pos.copy()
+def _filtra_periodo(df, coluna):
+    if df.empty or coluna not in df.columns or not periodo_ok:
+        return df
+    s = df[coluna]
+    return df[(s >= ini_ts) & (s < fim_ts)]
 
-if not cps_vig_f.empty and "distancia_km" in cps_vig_f.columns and "placa" in cps_vig_f.columns:
-    km_por_placa = cps_vig_f.groupby("placa")["distancia_km"].sum().to_dict()
-else:
-    km_por_placa = {}
 
-df_unificado = pd.DataFrame({"placa": placas_disp})
-df_unificado["eventos_safe"] = 0
-df_unificado["eventos_cps"] = 0
+def _filtra_placas(df):
+    if df.empty or "placa" not in df.columns or not placas_sel:
+        return df
+    return df[df["placa"].isin(placas_sel)]
 
-if not df_s.empty and "placa" in df_s.columns:
-    safe_counts = df_s.groupby("placa").size().reset_index(name="eventos_safe_calc")
-    df_unificado = pd.merge(df_unificado, safe_counts, on="placa", how="left")
-    df_unificado["eventos_safe"] = df_unificado["eventos_safe_calc"].fillna(0)
-    df_unificado.drop(columns=[c for c in ["eventos_safe_calc"] if c in df_unificado.columns], inplace=True)
 
-if not cps_inf_f.empty and "placa" in cps_inf_f.columns:
-    cps_inf_counts = cps_inf_f.groupby("placa").size().reset_index(name="eventos_cps_calc")
-    df_unificado = pd.merge(df_unificado, cps_inf_counts, on="placa", how="left")
-    df_unificado["eventos_cps"] = df_unificado["eventos_cps_calc"].fillna(0)
-    df_unificado.drop(columns=[c for c in ["eventos_cps_calc"] if c in df_unificado.columns], inplace=True)
+df_s = _filtra_placas(_filtra_periodo(df_safe, "dt_evento"))
+cps_inf_f = _filtra_placas(_filtra_periodo(cps_infracoes, "dt_evento"))
+cps_vig_f = _filtra_placas(_filtra_periodo(cps_viagens, "dt_viagem"))
+cps_pos_f = _filtra_placas(cps_pos)
 
-df_unificado["total_eventos"] = df_unificado["eventos_safe"] + df_unificado["eventos_cps"]
-df_unificado["km_rodado"] = df_unificado["placa"].map(km_por_placa).fillna(0.0).round(2)
-
-if df_unificado["km_rodado"].sum() == 0:
-    np.random.seed(42)
-    dias_diff = (data_sel[1] - data_sel[0]).days + 1 if isinstance(data_sel, (tuple, list)) and len(data_sel) == 2 else 1
-    df_unificado["km_rodado"] = df_unificado["placa"].map(lambda p: round(np.random.randint(15, 60) * max(1, dias_diff), 2))
-
-df_unificado["km_por_evento"] = np.where(
-    df_unificado["total_eventos"] > 0,
-    (df_unificado["km_rodado"] / df_unificado["total_eventos"]).round(1),
-    df_unificado["km_rodado"]
+km_por_placa = (
+    cps_vig_f.groupby("placa")["distancia_km"].sum().to_dict()
+    if not cps_vig_f.empty and "distancia_km" in cps_vig_f.columns else {}
 )
 
-if not cps_pos_f.empty and "odometro" in cps_pos_f.columns:
-    odo_map = cps_pos_f.set_index("placa")["odometro"].to_dict()
-    df_unificado["odometro_atual"] = df_unificado["placa"].map(odo_map).fillna(0)
-else:
-    df_unificado["odometro_atual"] = 0
+df_unificado = pd.DataFrame({"placa": placas_disp})
+if df_unificado.empty:
+    df_unificado = pd.DataFrame(columns=["placa"])
+
+safe_cnt = df_s.groupby("placa").size() if not df_s.empty and "placa" in df_s.columns else pd.Series(dtype=int)
+cps_cnt = cps_inf_f.groupby("placa").size() if not cps_inf_f.empty and "placa" in cps_inf_f.columns else pd.Series(dtype=int)
+odo_serie = (
+    cps_pos_f.groupby("placa")["odometro"].max()
+    if not cps_pos_f.empty and "odometro" in cps_pos_f.columns else pd.Series(dtype=float)
+)
+
+df_unificado["eventos_safe"] = df_unificado["placa"].map(safe_cnt).fillna(0).astype(int)
+df_unificado["eventos_cps"] = df_unificado["placa"].map(cps_cnt).fillna(0).astype(int)
+df_unificado["total_eventos"] = df_unificado["eventos_safe"] + df_unificado["eventos_cps"]
+df_unificado["km_rodado"] = df_unificado["placa"].map(km_por_placa).fillna(0.0).astype(float).round(2)
+df_unificado["odometro_atual"] = df_unificado["placa"].map(odo_serie).fillna(0)
+
+# Sem dados reais de quilometragem, gera uma estimativa e sinaliza isso na tela
+km_estimado = False
+if not df_unificado.empty and df_unificado["km_rodado"].sum() == 0:
+    rng = np.random.default_rng(42)
+    dias = (data_sel[1] - data_sel[0]).days + 1 if periodo_ok else 1
+    df_unificado["km_rodado"] = (rng.integers(15, 60, len(df_unificado)) * max(1, dias)).astype(float)
+    km_estimado = True
+
+kpe = df_unificado["km_rodado"] / df_unificado["total_eventos"].where(df_unificado["total_eventos"] > 0)
+df_unificado["km_por_evento"] = kpe.fillna(df_unificado["km_rodado"]).round(1)
 
 if placas_sel:
     df_unificado = df_unificado[df_unificado["placa"].isin(placas_sel)]
 
-# ==============================================================================
-# 7. CABEÇALHO & KPIS ADAPTATIVOS
-# ==============================================================================
-col_h1, col_h2 = st.columns([8, 4])
-with col_h1:
-    st.markdown(f"""
-<h1 class="hero-title">PAINEL GESTOR • <span class="hl">{painel_modo.upper()}</span></h1>
-<p class="hero-sub">API Complementar &amp; Telemetria Operacional Avançada</p>""", unsafe_allow_html=True)
-
-with col_h2:
-    ligados = len(cps_pos_f[cps_pos_f["ignicao"] == 1]) if not cps_pos_f.empty and "ignicao" in cps_pos_f.columns else 0
-    st.markdown(f"""
-<div class="frota-badge">
-  <div class="badge-label">Frota Ativa CPS</div>
-  <div class="badge-val"><span class="frota-dot"></span>{ligados} Ignições Ligadas</div>
-</div>""", unsafe_allow_html=True)
-
-if "Painel Gestor" in painel_modo:
-    kpi_ev1 = len(df_s)
-    kpi_ev2 = int(df_s["nivel_risco"].str.contains("crítico|critico", case=False, na=False).sum()) if not df_s.empty and "nivel_risco" in df_s.columns else 0
-    kpi_lbl1, kpi_lbl2 = "Alarmes Gestor (Dashcam)", "Eventos Críticos (IA)"
-    kpi_txt1, kpi_txt2 = f"{kpi_ev1:,}", f"{kpi_ev2:,}"
-elif "CPS" in painel_modo:
-    kpi_ev1 = len(cps_inf_f)
-    kpi_ev2 = len(cps_pos_f[cps_pos_f["velocidade"] > 80]) if not cps_pos_f.empty and "velocidade" in cps_pos_f.columns else 0
-    kpi_lbl1, kpi_lbl2 = "Infrações CPS", "Veículos Acima 80km/h"
-    kpi_txt1, kpi_txt2 = f"{kpi_ev1:,}", f"{kpi_ev2:,}"
-else:
-    kpi_ev1 = int(df_unificado["total_eventos"].sum())
-    kpi_ev2 = int(df_unificado["eventos_safe"].sum())
-    kpi_lbl1, kpi_lbl2 = "Total Eventos (Unificado)", "Eventos Gestor Safe"
-    kpi_txt1, kpi_txt2 = f"{kpi_ev1:,}", f"{kpi_ev2:,}"
-
-tot_km_periodo = int(df_unificado["km_rodado"].sum())
-km_por_evento_geral = round(tot_km_periodo / max(1, kpi_ev1), 1)
-odo_medio = int(df_unificado["odometro_atual"].mean()) if not df_unificado.empty else 0
-
-col_k1, col_k2, col_k3, col_k4, col_k5, col_k6 = st.columns(6)
-
-def card_master(col, titulo, valor, rodape, cor, tooltip):
-    col.markdown(f"""
-<div class="pbi-card" title="{tooltip}">
-  <div class="pbi-glow" style="background: radial-gradient(circle 160px at 100% 0%, {cor}33, transparent 70%);"></div>
-  <div class="pbi-card-border-top" style="background: linear-gradient(90deg, {cor}, #7928CA, {cor});"></div>
-  <div class="pbi-card-title">{titulo} <span class="info-dot">ℹ</span></div>
-  <div class="pbi-card-val">{valor}</div>
-  <div class="pbi-card-footer" style="color:{cor};">{rodape}</div>
-</div>""", unsafe_allow_html=True)
-
-card_master(col_k1, kpi_lbl1, kpi_txt1, "Volume Selecionado", "#FF3366", "Contabilização exata no banco de dados.")
-card_master(col_k2, kpi_lbl2, kpi_txt2, "Indicador Prioritário", "#FFAA00", "Eventos de alta atenção.")
-card_master(col_k3, "KM Rodado (Período)", f"{tot_km_periodo:,} km", "Filtrado por Data", "#00FF87", "Quilometragem real estritamente no intervalo selecionado.")
-card_master(col_k4, "Média KM por Evento", f"{km_por_evento_geral:,} km", "Distância Média s/ Incidente", "#00B4D8", "KM rodados para cada ocorrência registrada.")
-card_master(col_k5, "Odômetro Médio", f"{odo_medio:,} km", "Leitura Atual CPS", "#9D4EDD", "Média do odômetro da frota.")
-card_master(col_k6, "Veículos Ativos", f"{len(df_unificado)}", "Frota Ativa", "#00FF87", "Total de placas ativas.")
-
-st.markdown("<div style='margin-bottom: 24px;'></div>", unsafe_allow_html=True)
+aviso_km = " • estimado" if km_estimado else ""
 
 # ==============================================================================
-# 8. UTILITÁRIOS: TEMA PLOTLY, VALORES DE COLUNA E EXCEL
+# 9. NAVEGAÇÃO EM ABAS (renderiza só a página escolhida, o que deixa a troca rápida)
 # ==============================================================================
-def aplicar_tema(fig, height=400):
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Plus Jakarta Sans, sans-serif", color="#E5E7EB", size=12),
-        colorway=["#00FF87", "#00B4D8", "#7928CA", "#FFAA00", "#FF3366", "#9D4EDD"],
-        margin=dict(l=16, r=16, t=28, b=16),
-        height=height,
-        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#D1D5DB")),
-        hoverlabel=dict(
-            bgcolor="#18112D",
-            font=dict(color="#F3F4F6", family="Plus Jakarta Sans, sans-serif"),
-            bordercolor="#00FF87"
-        ),
-    )
-    if not any(trace.type == "pie" for trace in fig.data):
-        fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.08)", linecolor="rgba(255,255,255,0.08)")
-        fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.08)", linecolor="rgba(255,255,255,0.08)")
-    return fig
-
-def valores_coluna(df, coluna, padrao=None):
-    if coluna in df.columns:
-        return df[coluna].tolist()
-    return [padrao] * len(df)
-
-@st.cache_data(show_spinner=False)
-def gerar_excel_master(dados):
-    buf = io.BytesIO()
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Consolidado_Supremo"
-    ws["B2"] = "RELATÓRIO MASTER EXECUTIVO - SAFE & CPS"
-    ws["B2"].font = Font(size=14, bold=True, color="18112E")
-
-    headers = ["PLACA", "ODÔMETRO (KM)", "KM RODADO", "EVENTOS GESTOR SAFE", "EVENTOS CPS", "TOTAL EVENTOS", "KM POR EVENTO (MÉDIA)"]
-    for col_num, h in enumerate(headers, 2):
-        cell = ws.cell(row=4, column=col_num, value=h)
-        cell.fill = PatternFill(start_color="18112E", end_color="18112E", fill_type="solid")
-        cell.font = Font(color="00FF87", bold=True)
-
-    for row_idx, r in enumerate(dados.itertuples(index=False), 5):
-        ws.cell(row=row_idx, column=2, value=str(r[0]))
-        ws.cell(row=row_idx, column=3, value=int(r[4]))
-        ws.cell(row=row_idx, column=4, value=float(r[5]))
-        ws.cell(row=row_idx, column=5, value=int(r[1]))
-        ws.cell(row=row_idx, column=6, value=int(r[2]))
-        ws.cell(row=row_idx, column=7, value=int(r[3]))
-        ws.cell(row=row_idx, column=8, value=float(r[6]))
-
-    wb.save(buf)
-    return buf.getvalue()
+pagina = st.radio("Navegação", PAGINAS, horizontal=True, label_visibility="collapsed", key="nav_principal")
 
 # ==============================================================================
-# 9. ABAS DE NAVEGAÇÃO DO COCKPIT
+# 10. PÁGINAS
 # ==============================================================================
-aba_geral, aba_mapa, aba_ranking, aba_veiculo, aba_decisao, aba_export = st.tabs([
-    "🎯 Visão Geral & Desempenho",
-    "🗺️ Mapa Inteligente Master (Camadas)",
-    "📊 Rankings (Maiores e Menores)",
-    "🚛 Raio-X Individual & Odômetro",
-    "⚡ Suporte à Decisão",
-    "📤 Exportação de Relatórios"
-])
+if pagina == MENU_VISAO:
+    hero("📊", "Dashboard Executivo", "Visão geral da frota • quilometragem, alertas e telemetria integrados")
 
-# ------------------------------------------------------------------------------
-# ABA 1: VISÃO GERAL & DESEMPENHO
-# ------------------------------------------------------------------------------
-with aba_geral:
-    col_g1, col_g2 = st.columns([7, 5])
-    with col_g1:
-        st.subheader("🎯 Correlação: KM Rodados vs Eventos")
-        st.caption("Análise de distância percorrida e volume de ocorrências por veículo (veículos sem KM foram filtrados para clareza).")
+    tot_km = int(df_unificado["km_rodado"].sum()) if not df_unificado.empty else 0
+    tot_ev = int(df_unificado["total_eventos"].sum()) if not df_unificado.empty else 0
+    ev_safe_tot = int(df_unificado["eventos_safe"].sum()) if not df_unificado.empty else 0
+    ev_cps_tot = int(df_unificado["eventos_cps"].sum()) if not df_unificado.empty else 0
+    ligados = int((cps_pos_f["ignicao"] == 1).sum()) if not cps_pos_f.empty and "ignicao" in cps_pos_f.columns else 0
 
-        df_scatter = df_unificado[df_unificado["km_rodado"] > 0].copy()
-        if not df_scatter.empty:
-            fig_epk = px.scatter(
-                df_scatter, x="km_rodado", y="total_eventos", size="total_eventos", color="km_por_evento",
-                color_continuous_scale=[[0, "#FF3366"], [0.5, "#FFAA00"], [1, "#00FF87"]],
-                hover_data=["placa", "odometro_atual", "eventos_safe", "eventos_cps"],
-                labels={"km_rodado": "KM Rodado", "total_eventos": "Total de Eventos", "km_por_evento": "KM/Evento"}
-            )
-            fig_epk.update_traces(marker=dict(opacity=0.88, line=dict(width=1, color="rgba(255,255,255,0.35)")))
-            aplicar_tema(fig_epk, height=400)
-            st.plotly_chart(fig_epk, use_container_width=True)
-        else:
-            st.info("Nenhum dado de KM rodado disponível para o filtro atual.")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    render_bi_card(c1, "KM rodado total", f"{tot_km:,} km", f"▲ Frota ativa{aviso_km}", VERDE, "🛣️", 0)
+    render_bi_card(c2, "Eventos gerais", f"{tot_ev:,}", "Safe + CPS integrados", AMBAR, "🔔", 60)
+    render_bi_card(c3, "Alertas dashcam", f"{ev_safe_tot:,}", "Gestor Safe", VERMELHO, "📷", 120)
+    render_bi_card(c4, "Infrações CPS", f"{ev_cps_tot:,}", "Telemetria CPS", AZUL, "⚡", 180)
+    render_bi_card(c5, "Ignições ativas", f"{ligados}", "Veículos em operação", ROXO, "🔑", 240)
 
-    with col_g2:
-        st.subheader("📊 Composição de Ocorrências (Gestor vs CPS)")
-        if not df_unificado.empty:
-            comp_df = pd.DataFrame({
-                "Sistema": ["Gestor Safe (Dashcams)", "CPS (Telemetria)"],
-                "Quantidade": [int(df_unificado["eventos_safe"].sum()), int(df_unificado["eventos_cps"].sum())]
-            })
-            fig_c = px.pie(comp_df, names="Sistema", values="Quantidade", hole=0.5, color_discrete_sequence=["#FF3366", "#00B4D8"])
-            fig_c.update_traces(textinfo="percent", textfont=dict(size=13, color="#F3F4F6"), marker=dict(line=dict(color="#0B0716", width=2)))
-            aplicar_tema(fig_c, height=400)
-            st.plotly_chart(fig_c, use_container_width=True)
+    sec("Evolução operacional")
+    col_evo1, col_evo2 = st.columns(2)
 
-    st.markdown("---")
-    st.subheader("📈 Análise Detalhada de Ocorrências & Excesso de Velocidade")
-
-    ev_list = []
+    frames_eventos = []
     if not df_s.empty:
-        tmp_s = df_s.copy()
-        if "dt_evento" in tmp_s.columns: tmp_s["data_hora"] = tmp_s["dt_evento"]
-        tmp_s["sistema"] = "Gestor Safe"
-        ev_list.append(tmp_s[["placa", "descricao", "velocidade", "data_hora", "sistema"]])
+        frames_eventos.append(df_s["dt_evento"].dt.date.value_counts().rename("qtd"))
     if not cps_inf_f.empty:
-        tmp_c = cps_inf_f.copy()
-        if "inicio" in tmp_c.columns: tmp_c["data_hora"] = pd.to_datetime(tmp_c["inicio"], errors="coerce")
-        elif "dt_evento" in tmp_c.columns: tmp_c["data_hora"] = tmp_c["dt_evento"]
-        tmp_c["sistema"] = "CPS Telemetria"
-        ev_list.append(tmp_c[["placa", "descricao", "velocidade", "data_hora", "sistema"]])
+        frames_eventos.append(cps_inf_f["dt_evento"].dt.date.value_counts().rename("qtd"))
 
-    df_todos_eventos = pd.concat(ev_list, ignore_index=True) if ev_list else pd.DataFrame(columns=["placa", "descricao", "velocidade", "data_hora", "sistema"])
-
-    col_sub1, col_sub2 = st.columns(2)
-
-    with col_sub1:
-        st.markdown("##### 📊 Ocorrências por Tipo / Alerta")
-        if not df_todos_eventos.empty and "descricao" in df_todos_eventos.columns:
-            tipo_counts = df_todos_eventos["descricao"].value_counts().reset_index()
-            tipo_counts.columns = ["Tipo de Evento", "Quantidade"]
-            fig_tipo = px.bar(
-                tipo_counts.head(8), x="Quantidade", y="Tipo de Evento", orientation="h",
-                text="Quantidade", color="Quantidade",
-                color_continuous_scale=[[0, "#00B4D8"], [1, "#00FF87"]]
-            )
-            aplicar_tema(fig_tipo, height=320)
-            fig_tipo.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_tipo, use_container_width=True)
+    with col_evo1, st.container(border=True):
+        st.markdown("**📈 Ocorrências por dia**")
+        if frames_eventos:
+            serie_dia = pd.concat(frames_eventos).groupby(level=0).sum().sort_index()
+            df_ev_dia = serie_dia.reset_index().rename(columns={"index": "data", "dt_evento": "data"})
+            df_ev_dia.columns = ["data", "qtd"]
+            fig = px.area(df_ev_dia, x="data", y="qtd", markers=True,
+                          labels={"data": "Data", "qtd": "Eventos"}, color_discrete_sequence=[VERDE])
+            fig.update_traces(line=dict(width=3), fillcolor="rgba(0,200,83,0.15)")
+            mostrar_grafico(aplicar_tema(fig, 290))
         else:
-            st.info("Nenhum evento registrado no período.")
+            st.info("Sem eventos no período.")
 
-    with col_sub2:
-        st.markdown("##### 🚛 Top 8 Veículos com Mais Ocorrências")
-        if not df_unificado.empty:
-            top_veics = df_unificado.sort_values(by="total_eventos", ascending=False).head(8)
-            fig_veic = px.bar(
-                top_veics, x="placa", y="total_eventos", text="total_eventos",
-                labels={"placa": "Placa do Veículo", "total_eventos": "Total de Ocorrências"},
-                color="total_eventos", color_continuous_scale=[[0, "#FFAA00"], [1, "#FF3366"]]
-            )
-            aplicar_tema(fig_veic, height=320)
-            st.plotly_chart(fig_veic, use_container_width=True)
+    with col_evo2, st.container(border=True):
+        st.markdown(f"**🛣️ Quilometragem por dia{aviso_km}**")
+        if not cps_vig_f.empty and "dt_viagem" in cps_vig_f.columns:
+            df_km_dia = (cps_vig_f.assign(data=cps_vig_f["dt_viagem"].dt.date)
+                         .groupby("data")["distancia_km"].sum().reset_index())
+            fig = px.line(df_km_dia, x="data", y="distancia_km", markers=True,
+                          labels={"data": "Data", "distancia_km": "KM"}, color_discrete_sequence=[AZUL])
+            fig.update_traces(line=dict(width=3))
+            mostrar_grafico(aplicar_tema(fig, 290))
         else:
-            st.info("Sem dados de veículos.")
+            st.info("Sem dados de viagens no período para calcular a quilometragem.")
 
-    st.markdown("---")
-    st.markdown("##### ⚡ Raio-X de Excesso de Velocidade & Horários de Pico")
+    sec("Composição e destaques")
+    col_c, col_d = st.columns([1, 2])
 
-    col_vel1, col_vel2, col_vel3 = st.columns(3)
+    with col_c, st.container(border=True):
+        st.markdown("**🧭 Origem dos eventos**")
+        if ev_safe_tot + ev_cps_tot > 0:
+            fig = px.pie(names=["Gestor Safe", "CPS Telemetria"], values=[ev_safe_tot, ev_cps_tot],
+                         hole=0.62, color_discrete_sequence=[VERDE, AZUL])
+            fig.update_traces(textinfo="percent", textfont=dict(size=13, color="#FFFFFF"),
+                              hovertemplate="%{label}: %{value}<extra></extra>")
+            mostrar_grafico(aplicar_tema(fig, 290, legenda=True))
+        else:
+            st.info("Sem eventos no período.")
 
-    if not df_todos_eventos.empty and "velocidade" in df_todos_eventos.columns:
-        df_vel = df_todos_eventos[df_todos_eventos["velocidade"] > 0].copy()
-        max_vel = int(df_vel["velocidade"].max()) if not df_vel.empty else 0
-        veic_max_vel = df_vel.loc[df_vel["velocidade"].idxmax(), "placa"] if not df_vel.empty and max_vel > 0 else "N/D"
-        total_alertas_vel = len(df_vel)
+    with col_d, st.container(border=True):
+        st.markdown("**🏁 Veículos com mais ocorrências**")
+        top = df_unificado.sort_values("total_eventos", ascending=False).head(8) if not df_unificado.empty else pd.DataFrame()
+        if not top.empty and top["total_eventos"].sum() > 0:
+            fig = px.bar(top.sort_values("total_eventos"), x="total_eventos", y="placa", orientation="h",
+                         text="total_eventos", color="total_eventos",
+                         color_continuous_scale=["#7DD3FC", VERDE, "#065F46"],
+                         labels={"total_eventos": "Eventos", "placa": "Placa"})
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_layout(coloraxis_showscale=False)
+            mostrar_grafico(aplicar_tema(fig, 290))
+        else:
+            st.info("Sem ocorrências por veículo.")
+
+elif pagina == MENU_MAPA:
+    hero("🗺️", "Mapa Operacional", "Camadas de GPS, alertas Safe e infrações CPS em um único painel")
+
+    c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+    with c_m1:
+        camada_pos = st.checkbox("📍 Posição atual GPS", value=True)
+    with c_m2:
+        camada_safe = st.checkbox("🚨 Alertas Gestor Safe", value=True)
+    with c_m3:
+        camada_inf = st.checkbox("⚡ Infrações CPS", value=True)
+    with c_m4:
+        camada_calor = st.checkbox("🔥 Mapa de calor", value=False)
+
+    partes = []
+    if camada_pos and not cps_pos_f.empty and {"latitude", "longitude"} <= set(cps_pos_f.columns):
+        p = cps_pos_f.dropna(subset=["latitude", "longitude"])
+        partes.append(pd.DataFrame({
+            "lat": p["latitude"], "lon": p["longitude"], "peso": 1,
+            "detalhe": "GPS • Placa " + p["placa"].astype(str) + " • Odômetro " + p["odometro"].astype(str) + " km",
+        }))
+    if camada_safe and not df_s.empty and {"latitude", "longitude"} <= set(df_s.columns):
+        p = df_s.dropna(subset=["latitude", "longitude"])
+        partes.append(pd.DataFrame({
+            "lat": p["latitude"], "lon": p["longitude"], "peso": 4,
+            "detalhe": "Safe • Placa " + p["placa"].astype(str) + " • " + p["descricao"].astype(str),
+        }))
+    if camada_inf and not cps_inf_f.empty and {"latitude", "longitude"} <= set(cps_inf_f.columns):
+        p = cps_inf_f.dropna(subset=["latitude", "longitude"])
+        partes.append(pd.DataFrame({
+            "lat": p["latitude"], "lon": p["longitude"], "peso": 3,
+            "detalhe": "CPS • Placa " + p["placa"].astype(str) + " • " + p["descricao"].astype(str),
+        }))
+    pontos = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+    with st.container(border=True):
+        if pontos.empty:
+            st.info("Nenhum ponto geolocalizado para as camadas e filtros selecionados.")
+        elif camada_calor:
+            fig = go.Figure(data=DensityTrace(
+                lat=pontos["lat"], lon=pontos["lon"], z=pontos["peso"], radius=22,
+                colorscale="Turbo", opacity=0.85,
+            ))
+            fig.update_layout(**{MAP_LAYOUT_KEY: dict(style="carto-positron",
+                                                       center=dict(lat=-23.55, lon=-46.63), zoom=8)},
+                              margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)", height=600)
+            mostrar_mapa(fig)
+        else:
+            agregado = pontos.groupby(["lat", "lon"]).agg(
+                total=("detalhe", "size"),
+                detalhes=("detalhe", lambda x: "<br>".join(x.head(15))),
+            ).reset_index()
+            fig = go.Figure(ScatterTrace(
+                lat=agregado["lat"], lon=agregado["lon"], mode="markers",
+                marker=dict(size=np.clip(agregado["total"] * 4 + 10, 10, 30),
+                            color=agregado["total"], colorscale="Turbo", opacity=0.9, showscale=False),
+                text=[f"<b>Eventos no ponto: {t}</b><br><br>{d}" for t, d in zip(agregado["total"], agregado["detalhes"])],
+                hoverinfo="text", name="Ocorrências",
+            ))
+            fig.update_layout(**{MAP_LAYOUT_KEY: dict(style="carto-positron",
+                                                       center=dict(lat=-23.55, lon=-46.63), zoom=8)},
+                              paper_bgcolor="rgba(0,0,0,0)", height=600, margin=dict(l=0, r=0, t=0, b=0))
+            mostrar_mapa(fig)
+
+elif pagina == MENU_RANKING:
+    hero("🏆", "Rankings de Veículos", "Desempenho por veículo considerando veículos com KM > 1")
+
+    df_ranking = df_unificado[df_unificado["km_rodado"] > 1].copy() if not df_unificado.empty else pd.DataFrame()
+    vmax_kpe = float(df_ranking["km_por_evento"].max()) if not df_ranking.empty else 1.0
+    vmax_kpe = vmax_kpe if vmax_kpe > 0 else 1.0
+
+    cfg_rank = {
+        "placa": st.column_config.TextColumn("Placa"),
+        "eventos_safe": st.column_config.NumberColumn("Safe", format="%d"),
+        "eventos_cps": st.column_config.NumberColumn("CPS", format="%d"),
+        "km_rodado": st.column_config.NumberColumn("KM rodado", format="%.1f km"),
+        "km_por_evento": st.column_config.ProgressColumn("KM por evento", format="%.1f km",
+                                                         min_value=0, max_value=vmax_kpe),
+    }
+    cols_rank = ["placa", "eventos_safe", "eventos_cps", "km_rodado", "km_por_evento"]
+
+    if df_ranking.empty:
+        st.info("Sem veículos com quilometragem acima de 1 km no período.")
     else:
-        max_vel = 0
-        veic_max_vel = "N/D"
-        total_alertas_vel = 0
+        col_rk1, col_rk2 = st.columns(2)
+        with col_rk1:
+            sec("🔴 Maiores infratores (menor KM por evento)")
+            top_mai = df_ranking[df_ranking["total_eventos"] > 0].sort_values("km_por_evento").head(10)
+            st.dataframe(top_mai[cols_rank], use_container_width=True, hide_index=True, column_config=cfg_rank)
+        with col_rk2:
+            sec("🟢 Mais disciplinados (maior KM por evento)")
+            top_men = df_ranking.sort_values("km_por_evento", ascending=False).head(10)
+            st.dataframe(top_men[cols_rank], use_container_width=True, hide_index=True, column_config=cfg_rank)
 
-    card_master(col_vel1, "Maior Velocidade Atingida", f"{max_vel} km/h", "Registro Máximo", "#FF3366", "Pico de velocidade na frota.")
-    card_master(col_vel2, "Veículo com Maior Pico", f"{veic_max_vel}", "Placa Registrada", "#FFAA00", "Veículo que atingiu a maior velocidade.")
-    card_master(col_vel3, "Total Alertas de Velocidade", f"{total_alertas_vel:,}", "Infrações / Excesso", "#00FF87", "Volume de registros de velocidade.")
+elif pagina == MENU_RAIOX:
+    hero("🚛", "Raio-X Individual", "Histórico completo de um veículo no período selecionado")
 
-    if not df_todos_eventos.empty and "data_hora" in df_todos_eventos.columns:
-        df_todos_eventos["hora"] = pd.to_datetime(df_todos_eventos["data_hora"], errors="coerce").dt.hour
-        df_horas = df_todos_eventos.dropna(subset=["hora"]).groupby("hora").size().reset_index(name="qtd")
-
-        fig_hora = px.bar(
-            df_horas, x="hora", y="qtd", text="qtd",
-            labels={"hora": "Hora do Dia (0h - 23h)", "qtd": "Quantidade de Ocorrências"},
-            color="qtd", color_continuous_scale=[[0, "#7928CA"], [1, "#00FF87"]]
-        )
-        aplicar_tema(fig_hora, height=280)
-        st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
-        st.plotly_chart(fig_hora, use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# ABA 2: MAPA INTELIGENTE MASTER (CONTROLE INDEPENDENTE DE CAMADAS)
-# ------------------------------------------------------------------------------
-with aba_mapa:
-    st.subheader("🗺️ Mapa Inteligente Master (Camadas & Localização)")
-    st.caption("Selecione abaixo exatamente quais camadas deseja exibir no mapa interativo:")
-
-    col_mc1, col_mc2, col_mc3, col_mc4, col_mc5 = st.columns(5)
-    with col_mc1:
-        camada_pos = st.checkbox("📍 1. Posição Atual (GPS CPS)", value=True)
-    with col_mc2:
-        camada_safe = st.checkbox("🚨 2. Alertas Gestor Safe", value=True)
-    with col_mc3:
-        camada_inf = st.checkbox("⚡ 3. Infrações CPS", value=True)
-    with col_mc4:
-        camada_calor = st.checkbox("🔥 Mapa de Calor", value=False)
-    with col_mc5:
-        risco_map_filtro = st.selectbox("Filtrar Risco Safe", ["Todos", "Crítico", "Alto", "Médio"])
-
-    fig_map = go.Figure()
-
-    cp_m = cps_pos_f.dropna(subset=["latitude", "longitude"]) if not cps_pos_f.empty and "latitude" in cps_pos_f.columns and "longitude" in cps_pos_f.columns else pd.DataFrame()
-    df_m = df_s.dropna(subset=["latitude", "longitude"]) if not df_s.empty and "latitude" in df_s.columns and "longitude" in df_s.columns else pd.DataFrame()
-    if risco_map_filtro != "Todos" and not df_m.empty and "nivel_risco" in df_m.columns:
-        df_m = df_m[df_m["nivel_risco"].str.contains(risco_map_filtro, case=False, na=False)]
-    inf_m = cps_inf_f.dropna(subset=["latitude", "longitude"]) if not cps_inf_f.empty and "latitude" in cps_inf_f.columns and "longitude" in cps_inf_f.columns else pd.DataFrame()
-
-    if camada_calor and DensityTrace is not None:
-        heat_lats, heat_lons, heat_z = [], [], []
-        if camada_pos and not cp_m.empty:
-            heat_lats.extend(cp_m["latitude"].tolist()); heat_lons.extend(cp_m["longitude"].tolist()); heat_z.extend(cp_m["velocidade"].fillna(1).tolist() if "velocidade" in cp_m.columns else [1]*len(cp_m))
-        if camada_safe and not df_m.empty:
-            heat_lats.extend(df_m["latitude"].tolist()); heat_lons.extend(df_m["longitude"].tolist()); heat_z.extend([4]*len(df_m))
-        if camada_inf and not inf_m.empty:
-            heat_lats.extend(inf_m["latitude"].tolist()); heat_lons.extend(inf_m["longitude"].tolist()); heat_z.extend([3]*len(inf_m))
-
-        if heat_lats:
-            fig_map.add_trace(DensityTrace(
-                lat=heat_lats, lon=heat_lons, z=heat_z, radius=30,
-                colorscale=[[0, "rgba(0,255,135,0)"], [0.5, "rgba(121,40,202,0.6)"], [1, "rgba(255,51,102,0.9)"]],
-                showscale=False
-            ))
-        else:
-            st.info("Nenhum dado selecionado para compor o mapa de calor.")
-    else:
-        if camada_pos and not cp_m.empty:
-            fig_map.add_trace(ScatterTrace(
-                lat=cp_m["latitude"], lon=cp_m["longitude"], mode="markers",
-                marker=dict(size=10, color="#00FF87", symbol="circle", opacity=0.92),
-                name="📍 Posição Atual (CPS)",
-                text=[f"<b>Placa:</b> {p}<br><b>Odômetro:</b> {o} km<br><b>Velocidade:</b> {v} km/h"
-                      for p, o, v in zip(valores_coluna(cp_m, "placa"), valores_coluna(cp_m, "odometro"), valores_coluna(cp_m, "velocidade"))],
-                hoverinfo="text"
-            ))
-
-        if camada_safe and not df_m.empty:
-            fig_map.add_trace(ScatterTrace(
-                lat=df_m["latitude"], lon=df_m["longitude"], mode="markers",
-                marker=dict(size=12, color="#FF3366", symbol="circle", opacity=0.95),
-                name="🚨 Alerta Gestor Safe",
-                text=[f"<b>Placa:</b> {p}<br><b>Evento:</b> {d}<br><b>Risco:</b> {n}"
-                      for p, d, n in zip(valores_coluna(df_m, "placa"), valores_coluna(df_m, "descricao"), valores_coluna(df_m, "nivel_risco"))],
-                hoverinfo="text"
-            ))
-
-        if camada_inf and not inf_m.empty:
-            fig_map.add_trace(ScatterTrace(
-                lat=inf_m["latitude"], lon=inf_m["longitude"], mode="markers",
-                marker=dict(size=11, color="#FFAA00", symbol="circle", opacity=0.9),
-                name="⚡ Infração CPS",
-                text=[f"<b>Placa:</b> {p}<br><b>Infração:</b> {d}<br><b>Vel:</b> {v} km/h"
-                      for p, d, v in zip(valores_coluna(inf_m, "placa"), valores_coluna(inf_m, "descricao"), valores_coluna(inf_m, "velocidade", 0))],
-                hoverinfo="text"
-            ))
-
-    all_lats, all_lons = [], []
-    if camada_pos and not cp_m.empty:
-        all_lats.extend(cp_m["latitude"].tolist()); all_lons.extend(cp_m["longitude"].tolist())
-    if camada_safe and not df_m.empty:
-        all_lats.extend(df_m["latitude"].tolist()); all_lons.extend(df_m["longitude"].tolist())
-    if camada_inf and not inf_m.empty:
-        all_lats.extend(inf_m["latitude"].tolist()); all_lons.extend(inf_m["longitude"].tolist())
-
-    lat_c = float(np.mean(all_lats)) if all_lats else -23.55
-    lon_c = float(np.mean(all_lons)) if all_lons else -46.63
-
-    fig_map.update_layout(
-        **{MAP_LAYOUT_KEY: dict(style="carto-darkmatter", center=dict(lat=lat_c, lon=lon_c), zoom=8)},
-        dragmode="pan", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=560,
-        margin=dict(l=0, r=0, t=0, b=0),
-        legend=dict(bgcolor="rgba(14,10,28,0.9)", font=dict(color="#FFF"), bordercolor="rgba(0,255,135,.3)", borderwidth=1)
-    )
-    st.plotly_chart(fig_map, use_container_width=True, config={"scrollZoom": True})
-
-# ------------------------------------------------------------------------------
-# ABA 3: RANKINGS
-# ------------------------------------------------------------------------------
-with aba_ranking:
-    st.subheader("📊 Rankings Operacionais: Desempenho da Frota")
-
-    col_rk1, col_rk2 = st.columns(2)
-    with col_rk1:
-        st.markdown("##### 🔴 Menor KM por Evento (Maiores Infratores)")
-        top_mai = df_unificado[df_unificado["total_eventos"] > 0].sort_values(by="km_por_evento", ascending=True).head(10)
-        st.dataframe(top_mai[["placa", "eventos_safe", "eventos_cps", "km_rodado", "km_por_evento"]], use_container_width=True, hide_index=True)
-
-    with col_rk2:
-        st.markdown("##### 🟢 Maior KM por Evento (Mais Disciplinados)")
-        top_men = df_unificado.sort_values(by="km_por_evento", ascending=False).head(10)
-        st.dataframe(top_men[["placa", "eventos_safe", "eventos_cps", "km_rodado", "km_por_evento"]], use_container_width=True, hide_index=True)
-
-# ------------------------------------------------------------------------------
-# ABA 4: RAIO-X INDIVIDUAL & ODÔMETRO
-# ------------------------------------------------------------------------------
-with aba_veiculo:
-    st.subheader("🚛 Raio-X Individual por Veículo (Odômetro Real, KM e Eventos)")
     if placas_disp:
-        v_escolhido = st.selectbox("Selecione o Veículo", placas_disp, key="sel_veic_supremo")
-
+        v_escolhido = st.selectbox("Selecione o veículo", placas_disp)
         v_row = df_unificado[df_unificado["placa"] == v_escolhido]
-        v_odo = v_row["odometro_atual"].values[0] if not v_row.empty else 0
-        v_km = v_row["km_rodado"].values[0] if not v_row.empty else 0
-        v_ev_safe = v_row["eventos_safe"].values[0] if not v_row.empty else 0
-        v_ev_cps = v_row["eventos_cps"].values[0] if not v_row.empty else 0
-        v_km_ev = v_row["km_por_evento"].values[0] if not v_row.empty else 0.0
-
-        c_v1, c_v2, c_v3, c_v4 = st.columns(4)
-        card_master(c_v1, "Odômetro Atual", f"{v_odo:,} km", "Leitura CPS", "#00B4D8", "Hodômetro atual.")
-        card_master(c_v2, "KM Rodado", f"{v_km:,} km", "No Período Selecionado", "#00FF87", "Quilometragem real no intervalo.")
-        card_master(c_v3, "Eventos (Gestor + CPS)", f"{int(v_ev_safe)} + {int(v_ev_cps)}", "Dashcam + Telemetria", "#FF3366", "Ocorrências divididas por sistema.")
-        card_master(c_v4, "KM por Evento", f"{v_km_ev} km", "Distância Média s/ Alerta", "#FFAA00", "KM rodados por ocorrência.")
-
-        st.markdown("<div style='margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+        if v_row.empty:
+            st.info("Este veículo não tem registros no período selecionado.")
+        else:
+            r = v_row.iloc[0]
+            c_v1, c_v2, c_v3, c_v4 = st.columns(4)
+            render_bi_card(c_v1, "Odômetro atual", f"{int(r['odometro_atual']):,} km", "Fonte: CPS", AZUL, "🧭", 0)
+            render_bi_card(c_v2, "KM rodado", f"{r['km_rodado']:,.1f} km", f"No período{aviso_km}", VERDE, "🛣️", 60)
+            render_bi_card(c_v3, "Total de eventos", f"{int(r['total_eventos'])}", "Safe + CPS", VERMELHO, "🔔", 120)
+            render_bi_card(c_v4, "KM por evento", f"{r['km_por_evento']} km", "Média do período", AMBAR, "📏", 180)
 
         col_hx1, col_hx2 = st.columns(2)
-        with col_hx1:
-            st.markdown(f"##### 🚨 Alertas do Gestor Safe (Dashcams) - {v_escolhido}")
+        with col_hx1, st.container(border=True):
+            st.markdown(f"**🚨 Alertas Safe • {v_escolhido}**")
             df_v_safe = df_s[df_s["placa"] == v_escolhido] if not df_s.empty else pd.DataFrame()
             if not df_v_safe.empty:
-                st.dataframe(df_v_safe[["dt_evento", "descricao", "nivel_risco", "velocidade"]], use_container_width=True, hide_index=True)
+                cols = [c for c in ["dt_evento", "descricao", "nivel_risco", "velocidade"] if c in df_v_safe.columns]
+                st.dataframe(df_v_safe[cols].sort_values("dt_evento", ascending=False),
+                             use_container_width=True, hide_index=True)
             else:
-                st.info("Nenhum alarme Gestor Safe no período.")
-
-        with col_hx2:
-            st.markdown(f"##### ⚡ Infrações do Sistema CPS - {v_escolhido}")
-            df_v_cps = cps_inf_f[cps_inf_f["placa"] == v_escolhido] if not cps_inf_f.empty and "placa" in cps_inf_f.columns else pd.DataFrame()
+                st.info("Sem registros.")
+        with col_hx2, st.container(border=True):
+            st.markdown(f"**⚡ Infrações CPS • {v_escolhido}**")
+            df_v_cps = cps_inf_f[cps_inf_f["placa"] == v_escolhido] if not cps_inf_f.empty else pd.DataFrame()
             if not df_v_cps.empty:
-                st.dataframe(df_v_cps[["dt_evento", "descricao", "velocidade"]], use_container_width=True, hide_index=True)
+                cols = [c for c in ["dt_evento", "motorista", "descricao", "velocidade"] if c in df_v_cps.columns]
+                st.dataframe(df_v_cps[cols].sort_values("dt_evento", ascending=False),
+                             use_container_width=True, hide_index=True)
             else:
-                st.info("Nenhuma infração CPS no período.")
-
-# ------------------------------------------------------------------------------
-# ABA 5: SUPORTE À DECISÃO
-# ------------------------------------------------------------------------------
-with aba_decisao:
-    st.subheader("⚡ Diagnóstico Master & Ações Corretivas")
-    atencao_km = df_unificado[(df_unificado["total_eventos"] > 0) & (df_unificado["km_por_evento"] < 20)]["placa"].tolist()
-    if atencao_km:
-        st.markdown(f"""
-<div class="decision-box critical">
-  <b style="color:#FF3366; font-size:1.05rem;">🔴 ATENÇÃO: BAIXA DISTÂNCIA ENTRE ALERTAS (< 20 KM)</b><br>
-  Veículos registrando incidentes com muita frequência por quilômetro rodado: <b>{', '.join(atencao_km[:5])}</b>.<br>
-  <b>Ação Recomendada:</b> Reciclagem com os motoristas responsáveis por estas placas.
-</div>""", unsafe_allow_html=True)
+                st.info("Sem registros.")
     else:
-        st.markdown("""
-<div class="decision-box">
-  <b style="color:#00FF87; font-size:1.05rem;">🟢 OPERAÇÃO ESTÁVEL</b><br>
-  Nenhum veículo apresentou índice crítico de recorrência de alertas no período.
-</div>""", unsafe_allow_html=True)
+        st.info("Nenhum veículo disponível na base.")
 
-# ------------------------------------------------------------------------------
-# ABA 6: EXPORTAÇÃO EXCEL COMPLETA
-# ------------------------------------------------------------------------------
-with aba_export:
-    st.subheader("📤 Exportação de Relatório Executivo Master (.xlsx)")
+elif pagina == MENU_CONDUTORES:
+    hero("👤", "Condutores & Motoristas", "Ranking de ocorrências e histórico individual por condutor")
 
-    if not df_unificado.empty:
-        st.download_button(
-            "📊 Baixar Relatório Master Completo (.xlsx)",
-            data=gerar_excel_master(df_unificado),
-            file_name=f"Relatorio_Master_Supremo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+    if not cps_inf_f.empty:
+        ranking_mots = cps_inf_f.groupby("motorista").agg(
+            total_eventos=("descricao", "size"),
+            veiculos=("placa", lambda x: ", ".join(x.dropna().astype(str).unique())),
+            vel_max=("velocidade", "max"),
+        ).reset_index().sort_values("total_eventos", ascending=False)
+
+        col_rm1, col_rm2 = st.columns(2)
+        with col_rm1:
+            sec("🔴 Mais alertas")
+            st.dataframe(ranking_mots.head(10), use_container_width=True, hide_index=True)
+        with col_rm2:
+            sec("🟢 Mais disciplinados")
+            st.dataframe(ranking_mots.sort_values("total_eventos", ascending=True).head(10),
+                         use_container_width=True, hide_index=True)
+
+        sec("🔍 Histórico detalhado por condutor")
+        lista_mots = sorted(cps_inf_f["motorista"].dropna().unique().tolist())
+        mot_sel = st.selectbox("Escolha o motorista", lista_mots)
+        df_hm = cps_inf_f[cps_inf_f["motorista"] == mot_sel].sort_values("dt_evento", ascending=False)
+        cols_hm = [c for c in ["dt_evento", "placa", "descricao", "velocidade", "cidade"] if c in df_hm.columns]
+        st.dataframe(df_hm[cols_hm], use_container_width=True, hide_index=True)
+    else:
+        st.info("Sem dados de condutores no período.")
+
+elif pagina == MENU_EVENTOS:
+    hero("⚡", "Central Analítica de Eventos", "Sistemas operacionais, tipologias, reincidência e picos de velocidade")
+
+    sistema_aba = st.radio(
+        "Filtrar por sistema",
+        ["Ambos os sistemas", "Gestor Safe (Dashcam)", "CPS Telemetria (Infrações)"],
+        horizontal=True,
+    )
+
+    dfs_combinados = []
+    if sistema_aba in ["Ambos os sistemas", "Gestor Safe (Dashcam)"] and not df_s.empty:
+        t_s = df_s.copy()
+        t_s["Sistema_Origem"] = "Gestor Safe"
+        dfs_combinados.append(t_s)
+    if sistema_aba in ["Ambos os sistemas", "CPS Telemetria (Infrações)"] and not cps_inf_f.empty:
+        t_c = cps_inf_f.copy()
+        t_c["Sistema_Origem"] = "CPS Telemetria"
+        if "nivel_risco" not in t_c.columns:
+            t_c["nivel_risco"] = "Alto"
+        dfs_combinados.append(t_c)
+
+    if dfs_combinados:
+        df_ev_tab = pd.concat(dfs_combinados, ignore_index=True)
+        df_ev_tab["data_dia"] = df_ev_tab["dt_evento"].dt.date
+        dias_disponiveis = sorted(df_ev_tab["data_dia"].dropna().unique(), reverse=True)
+
+        c_sub1, c_sub2 = st.columns(2)
+        with c_sub1:
+            dia_especifico = st.selectbox("📅 Filtrar por data", ["Todos os dias"] + [str(d) for d in dias_disponiveis])
+        with c_sub2:
+            tipos_unicos = sorted(df_ev_tab["descricao"].dropna().unique().tolist())
+            tipo_especifico = st.selectbox("📌 Filtrar por tipologia", ["Todas as tipologias"] + tipos_unicos)
+
+        df_ev_filtrado = df_ev_tab
+        if dia_especifico != "Todos os dias":
+            df_ev_filtrado = df_ev_filtrado[df_ev_filtrado["data_dia"].astype(str) == dia_especifico]
+        if tipo_especifico != "Todas as tipologias":
+            df_ev_filtrado = df_ev_filtrado[df_ev_filtrado["descricao"] == tipo_especifico]
+
+        tot_evs_aba = len(df_ev_filtrado)
+        max_vel_aba = int(df_ev_filtrado["velocidade"].max()) if not df_ev_filtrado.empty else 0
+        veic_mais_ev = "N/D"
+        if not df_ev_filtrado.empty:
+            vc = df_ev_filtrado["placa"].value_counts()
+            veic_mais_ev = f"{vc.index[0]} ({vc.iloc[0]} eventos)"
+        veic_maior_vel = "N/D"
+        if not df_ev_filtrado.empty:
+            r_top = df_ev_filtrado.sort_values("velocidade", ascending=False).iloc[0]
+            veic_maior_vel = f"{r_top['placa']} ({int(r_top['velocidade'])} km/h)"
+
+        k_e1, k_e2, k_e3, k_e4 = st.columns(4)
+        render_bi_card(k_e1, "Eventos filtrados", f"{tot_evs_aba:,}", f"Sistema: {sistema_aba}", AMBAR, "🔔", 0)
+        render_bi_card(k_e2, "Velocidade máxima", f"{max_vel_aba} km/h", "Pico registrado", VERMELHO, "🏎️", 60)
+        render_bi_card(k_e3, "Mais ocorrências", veic_mais_ev, "Maior reincidência", AZUL, "🔁", 120)
+        render_bi_card(k_e4, "Maior velocidade", veic_maior_vel, "Veículo e teto", VERDE, "🎯", 180)
+
+        if not df_ev_filtrado.empty:
+            sec("📂 Detalhamento por tipologia")
+            resumo = df_ev_filtrado.groupby("descricao").agg(
+                quantidade=("placa", "size"),
+                vel_max=("velocidade", "max"),
+                veiculos=("placa", lambda x: ", ".join(x.dropna().astype(str).unique()[:3])),
+            ).reset_index().sort_values("quantidade", ascending=False)
+
+            for _, row_t in resumo.iterrows():
+                with st.expander(f"🔹 {row_t['descricao']} — {row_t['quantidade']} ocorrências • vel. máx {row_t['vel_max']} km/h"):
+                    st.markdown(f"**Veículos em destaque:** {row_t['veiculos']}")
+                    sub = df_ev_filtrado[df_ev_filtrado["descricao"] == row_t["descricao"]]
+                    cols_sub = [c for c in ["Sistema_Origem", "dt_evento", "placa", "motorista", "velocidade", "nivel_risco", "cidade"] if c in sub.columns]
+                    st.dataframe(sub[cols_sub].sort_values("dt_evento", ascending=False),
+                                 use_container_width=True, hide_index=True)
+
+            sec("📋 Registro mestre")
+            cols_master = [c for c in ["Sistema_Origem", "dt_evento", "placa", "motorista", "descricao", "velocidade", "nivel_risco", "cidade"] if c in df_ev_filtrado.columns]
+            st.dataframe(df_ev_filtrado[cols_master].sort_values("dt_evento", ascending=False),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum evento para os filtros escolhidos.")
+    else:
+        st.warning("Sem dados disponíveis para a seleção.")
+
+elif pagina == MENU_IA:
+    hero("🤖", "Assistente Operacional IA", "Modelo local via Ollama com acesso aos indicadores consolidados da frota")
+    st.markdown(f'<span class="badge-live">Ollama • {OLLAMA_MODEL}</span>', unsafe_allow_html=True)
+    st.write("")
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    for message in st.session_state.chat_history:
+        avatar = "🧑‍💼" if message["role"] == "user" else "🤖"
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ex: 'Qual o veículo com mais eventos?', 'Resumo operacional', 'Quem excedeu mais a velocidade?'"):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user", avatar="🧑‍💼"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant", avatar="🤖"):
+            with st.spinner("O Ollama está a analisar os dados operacionais da frota..."):
+                try:
+                    tot_km = int(df_unificado["km_rodado"].sum()) if not df_unificado.empty else 0
+                    tot_ev = int(df_unificado["total_eventos"].sum()) if not df_unificado.empty else 0
+                    top_v_str = (df_unificado.sort_values("total_eventos", ascending=False)
+                                 .head(5)[["placa", "total_eventos", "km_rodado", "km_por_evento"]]
+                                 .to_string(index=False)) if not df_unificado.empty else "N/D"
+                    top_m_str = "N/D"
+                    if not cps_inf_f.empty:
+                        m_agg = cps_inf_f.groupby("motorista").agg(
+                            total_eventos=("descricao", "size"),
+                            vel_max=("velocidade", "max"),
+                        ).reset_index()
+                        top_m_str = m_agg.sort_values("total_eventos", ascending=False).head(5).to_string(index=False)
+
+                    prompt_completo = f"""
+És o Analista Executivo Chefe de Frotas. Responde de forma direta e concisa com base nos dados abaixo:
+
+- MÉTRICAS GLOBAIS: KM Total: {tot_km:,} km | Total Eventos: {tot_ev}
+
+- TOP 5 VEÍCULOS MAIS INFRATORES:
+{top_v_str}
+
+- TOP 5 MOTORISTAS COM MAIS ALERTAS:
+{top_m_str}
+
+Pergunta do Gestor: {prompt}
+"""
+                    resposta = perguntar_ollama(prompt_completo)
+                except Exception as e:
+                    resposta = f"⚠️ Erro ao processar no Ollama: {e}"
+
+                st.markdown(resposta)
+                st.session_state.chat_history.append({"role": "assistant", "content": resposta})
+
+elif pagina == MENU_AUDITORIA:
+    hero("🔍", "Auditoria de Eventos Brutos", "Validação em tempo real dos registros de origem")
+
+    col_aud1, col_aud2 = st.columns(2)
+    with col_aud1:
+        filtro_origem = st.selectbox("Sistema", ["Todos", "Gestor Safe", "CPS Telemetria"])
+    with col_aud2:
+        qtd_linhas = st.slider("Registros exibidos", 50, 1000, 200, 50)
+
+    audit_list = []
+    if not df_safe.empty:
+        audit_list.append(pd.DataFrame({
+            "Origem": "Gestor Safe", "Placa": _col(df_safe, "placa", "N/D").values,
+            "Data/Hora": df_safe["dt_evento"].values, "Descrição": _col(df_safe, "descricao", "N/D").values,
+            "Velocidade": _col(df_safe, "velocidade", 0).values,
+        }))
+    if not cps_infracoes.empty:
+        audit_list.append(pd.DataFrame({
+            "Origem": "CPS Telemetria", "Placa": _col(cps_infracoes, "placa", "N/D").values,
+            "Data/Hora": cps_infracoes["dt_evento"].values, "Descrição": _col(cps_infracoes, "descricao", "Infração").values,
+            "Velocidade": _col(cps_infracoes, "velocidade", 0).values,
+        }))
+
+    if audit_list:
+        df_aud = pd.concat(audit_list, ignore_index=True).sort_values("Data/Hora", ascending=False)
+        if filtro_origem != "Todos":
+            df_aud = df_aud[df_aud["Origem"] == filtro_origem]
+        st.dataframe(
+            df_aud.head(qtd_linhas), use_container_width=True, hide_index=True,
+            column_config={
+                "Data/Hora": st.column_config.DatetimeColumn("Data/Hora", format="DD/MM/YYYY HH:mm"),
+                "Velocidade": st.column_config.NumberColumn("Velocidade", format="%d km/h"),
+            },
         )
+    else:
+        st.info("Sem registros para auditar.")
+
+elif pagina == MENU_EXPORT:
+    hero("📤", "Exportação de Relatórios", "Relatórios executivos em PDF por condutor e planilha master em Excel")
+
+    def _txt(valor):
+        """Texto compatível com as fontes core do PDF (latin-1)."""
+        s = "" if valor is None else str(valor)
+        return s.encode("latin-1", "replace").decode("latin-1")
+
+    class RelatorioPDF(FPDF):
+        def header(self):
+            self.set_fill_color(11, 19, 43)
+            self.rect(0, 0, 210, 26, "F")
+            self.set_fill_color(0, 200, 83)
+            self.rect(0, 26, 210, 1.4, "F")
+            self.set_xy(12, 7)
+            self.set_font("helvetica", "B", 15)
+            self.set_text_color(255, 255, 255)
+            self.cell(130, 7, _txt("GESTOR CEABS • RELATÓRIO EXECUTIVO DE CONDUTA"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            self.set_x(12)
+            self.set_font("helvetica", "", 8.5)
+            self.set_text_color(148, 163, 184)
+            self.cell(130, 5, _txt("Mobilidade de Frota • Telemetria CPS + Gestor Safe"))
+            self.set_font("helvetica", "", 8)
+            self.set_xy(140, 9)
+            self.cell(58, 5, _txt(f"Emitido: {datetime.now():%d/%m/%Y %H:%M}"), align="R")
+            self.set_y(32)
+
+        def footer(self):
+            self.set_y(-14)
+            self.set_draw_color(226, 232, 240)
+            self.line(10, self.get_y(), 200, self.get_y())
+            self.set_y(-12)
+            self.set_font("helvetica", "", 7.5)
+            self.set_text_color(100, 116, 139)
+            self.cell(95, 5, _txt("Documento confidencial • uso interno"), align="L")
+            self.cell(95, 5, _txt(f"Página {self.page_no()} de {{nb}}"), align="R")
+
+    def _kpi(pdf, x, y, w, rotulo, valor, cor):
+        pdf.set_fill_color(248, 250, 252)
+        pdf.rect(x, y, w, 20, "F")
+        pdf.set_fill_color(*cor)
+        pdf.rect(x, y, 1.6, 20, "F")
+        pdf.set_xy(x + 5, y + 3)
+        pdf.set_font("helvetica", "B", 7)
+        pdf.set_text_color(100, 116, 139)
+        pdf.cell(w - 7, 4, _txt(rotulo.upper()))
+        pdf.set_xy(x + 5, y + 9)
+        pdf.set_font("helvetica", "B", 12)
+        pdf.set_text_color(15, 23, 42)
+        pdf.cell(w - 7, 8, _txt(valor))
+
+    def _table_header(pdf):
+        pdf.set_font("helvetica", "B", 8.5)
+        pdf.set_fill_color(11, 19, 43)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(42, 7, _txt("DATA / HORA"), align="C", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(28, 7, _txt("PLACA"), align="C", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(86, 7, _txt("TIPOLOGIA DO EVENTO"), align="L", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(34, 7, _txt("VELOCIDADE"), align="C", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    def criar_pdf_motorista(nome_mot, df_h, setor, msg_gestao, filtro_ev, apenas_120):
+        pdf = RelatorioPDF()
+        pdf.alias_nb_pages()
+        pdf.set_auto_page_break(auto=True, margin=22)
+        pdf.set_margins(10, 32, 10)
+        pdf.add_page()
+
+        datas = pd.to_datetime(df_h["dt_evento"], errors="coerce").dropna()
+        periodo_txt = f"{datas.min():%d/%m/%Y} a {datas.max():%d/%m/%Y}" if not datas.empty else "N/D"
+        vel_max = int(to_num(_col(df_h, "velocidade", 0)).fillna(0).max()) if not df_h.empty else 0
+        n_veic = df_h["placa"].nunique() if "placa" in df_h.columns else 0
+
+        y0 = pdf.get_y()
+        larg = (190 - 3 * 4) / 4
+        _kpi(pdf, 10, y0, larg, "Eventos", f"{len(df_h)}", (0, 200, 83))
+        _kpi(pdf, 10 + (larg + 4), y0, larg, "Velocidade máx.", f"{vel_max} km/h", (239, 68, 68))
+        _kpi(pdf, 10 + 2 * (larg + 4), y0, larg, "Veículos", f"{n_veic}", (2, 132, 199))
+        _kpi(pdf, 10 + 3 * (larg + 4), y0, larg, "Período", periodo_txt, (124, 58, 237))
+        pdf.set_y(y0 + 26)
+
+        y1 = pdf.get_y()
+        pdf.set_fill_color(241, 245, 249)
+        pdf.rect(10, y1, 190, 24, "F")
+        pdf.set_xy(14, y1 + 3)
+        pdf.set_font("helvetica", "B", 10)
+        pdf.set_text_color(11, 19, 43)
+        pdf.cell(110, 6, _txt(f"COLABORADOR: {str(nome_mot).upper()}"))
+        pdf.set_font("helvetica", "B", 9)
+        pdf.set_text_color(0, 140, 90)
+        pdf.cell(66, 6, _txt(f"SETOR: {str(setor).upper()}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(14)
+        pdf.set_font("helvetica", "", 8.5)
+        pdf.set_text_color(71, 85, 105)
+        filtro_txt = f"Tipologia: {filtro_ev}" + (" • somente > 120 km/h" if apenas_120 else "")
+        pdf.cell(176, 5, _txt(filtro_txt), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(14)
+        pdf.cell(176, 5, _txt(f"Registros exibidos: {len(df_h)}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_y(y1 + 28)
+
+        if msg_gestao and str(msg_gestao).strip():
+            pdf.set_font("helvetica", "B", 9)
+            pdf.set_text_color(11, 19, 43)
+            pdf.cell(0, 6, _txt("MOTIVO / ENCAMINHAMENTO DA GESTÃO"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("helvetica", "", 9)
+            pdf.set_text_color(51, 65, 85)
+            pdf.multi_cell(190, 5, _txt(msg_gestao), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(4)
+
+        pdf.set_font("helvetica", "B", 9)
+        pdf.set_text_color(11, 19, 43)
+        pdf.cell(0, 6, _txt("DETALHAMENTO DOS EVENTOS"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        _table_header(pdf)
+
+        zebra = False
+        for _, r in df_h.iterrows():
+            if pdf.get_y() > pdf.h - 26:
+                pdf.add_page()
+                _table_header(pdf)
+            dt_v = pd.to_datetime(r.get("dt_evento"), errors="coerce")
+            dt_s = f"{dt_v:%d/%m/%Y %H:%M}" if pd.notna(dt_v) else "N/D"
+            pl_s = _txt(r.get("placa", ""))
+            ds_s = _txt(str(r.get("descricao", ""))[:45])
+            try:
+                vel_num = int(float(r.get("velocidade", 0)))
+            except (TypeError, ValueError):
+                vel_num = 0
+
+            if zebra:
+                pdf.set_fill_color(240, 253, 244)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+            pdf.set_font("helvetica", "", 8)
+            pdf.set_text_color(30, 41, 59)
+            pdf.cell(42, 6, dt_s, align="C", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.cell(28, 6, pl_s, align="C", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.cell(86, 6, ds_s, align="L", fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+            if vel_num > 120:
+                pdf.set_font("helvetica", "B", 8)
+                pdf.set_text_color(220, 38, 38)
+            pdf.cell(34, 6, f"{vel_num} km/h", align="C", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            zebra = not zebra
+
+        return bytes(pdf.output())
+
+    def gerar_excel(dados):
+        buf = io.BytesIO()
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Consolidado"
+        ws.sheet_view.showGridLines = False
+
+        ws["B2"] = "RELATÓRIO MASTER • GESTOR & CPS"
+        ws["B2"].font = Font(size=16, bold=True, color="0B132B")
+        ws["B3"] = f"Gerado em {datetime.now():%d/%m/%Y %H:%M}"
+        ws["B3"].font = Font(size=9, italic=True, color="64748B")
+
+        headers = ["PLACA", "ODÔMETRO (km)", "KM RODADO", "EVENTOS SAFE", "EVENTOS CPS", "TOTAL", "KM / EVENTO"]
+        header_row = 5
+        borda = Border(*(Side(style="thin", color="E2E8F0"),) * 4)
+
+        for c_idx, h in enumerate(headers, 2):
+            cell = ws.cell(row=header_row, column=c_idx, value=h)
+            cell.fill = PatternFill(start_color="0B132B", end_color="0B132B", fill_type="solid")
+            cell.font = Font(color="00C853", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = borda
+
+        registros = dados.to_dict("records")
+        for r_idx, r in enumerate(registros, header_row + 1):
+            valores = [
+                str(r.get("placa", "")),
+                int(r.get("odometro_atual", 0) or 0),
+                float(r.get("km_rodado", 0) or 0),
+                int(r.get("eventos_safe", 0) or 0),
+                int(r.get("eventos_cps", 0) or 0),
+                int(r.get("total_eventos", 0) or 0),
+                float(r.get("km_por_evento", 0) or 0),
+            ]
+            for c_idx, v in enumerate(valores, 2):
+                cell = ws.cell(row=r_idx, column=c_idx, value=v)
+                cell.border = borda
+                cell.alignment = Alignment(horizontal="center")
+                if r_idx % 2 == 0:
+                    cell.fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+                if c_idx == 3:
+                    cell.number_format = "#,##0"
+                elif c_idx in (4, 8):
+                    cell.number_format = "#,##0.0"
+
+        ultima_linha = header_row + max(len(registros), 1)
+        ws.auto_filter.ref = f"B{header_row}:H{ultima_linha}"
+        ws.freeze_panes = f"B{header_row + 1}"
+        for col, larg in {"A": 2, "B": 14, "C": 16, "D": 14, "E": 15, "F": 15, "G": 12, "H": 15}.items():
+            ws.column_dimensions[col].width = larg
+
+        wb.save(buf)
+        return buf.getvalue()
+
+    tab_pdf, tab_excel = st.tabs(["📄 PDF executivo", "📊 Excel master"])
+
+    with tab_pdf:
+        lista_mots_pdf = sorted(cps_infracoes["motorista"].dropna().unique().tolist()) if not cps_infracoes.empty else []
+
+        if lista_mots_pdf:
+            col_p1, col_p2 = st.columns(2)
+            with col_p1, st.container(border=True):
+                st.markdown("**👤 Colaborador e filtros**")
+                mot_escolhido = st.selectbox("Colaborador / motorista", lista_mots_pdf, key="sel_mot_pdf")
+                df_hist_mot_full = cps_infracoes[cps_infracoes["motorista"] == mot_escolhido].copy()
+                tipos_eventos_mot = sorted(df_hist_mot_full["descricao"].dropna().unique().tolist())
+                evento_filtro_pdf = st.selectbox("Filtrar por tipologia", ["Todos os eventos"] + tipos_eventos_mot, key="sel_evento_pdf")
+                apenas_acima_120 = st.checkbox("⚡ Focar apenas em excessos de velocidade > 120 km/h", value=True, key="chk_120")
+                limite_registros = st.slider("Número máximo de eventos no PDF", 5, 50, 15, 5, key="slider_lim_pdf")
+
+            with col_p2, st.container(border=True):
+                st.markdown("**🧾 Encaminhamento**")
+                setor_destino = st.text_input("Setor responsável / direcionamento", value="Mobilidade de Frota",
+                                              placeholder="Ex: Mobilidade de Frota, Manutenção, Operações...",
+                                              key="txt_setor_pdf")
+                mensagem_gestor = st.text_area("Mensagem / justificativa para o gestor",
+                                               placeholder="Ex: Favor verificar o comportamento recorrente deste colaborador...",
+                                               key="txt_msg_pdf", height=120)
+
+            df_hist_mot = df_hist_mot_full
+            if evento_filtro_pdf != "Todos os eventos":
+                df_hist_mot = df_hist_mot[df_hist_mot["descricao"] == evento_filtro_pdf]
+            if apenas_acima_120:
+                is_speed = df_hist_mot["descricao"].str.contains("Velocidade", case=False, na=False)
+                df_hist_mot = df_hist_mot[(~is_speed) | (df_hist_mot["velocidade"] > 120)]
+
+            if not df_hist_mot.empty:
+                df_hist_mot = df_hist_mot.sort_values("dt_evento", ascending=False).head(limite_registros)
+                sec(f"Pré-visualização • {len(df_hist_mot)} eventos selecionados")
+                cols_prev = [c for c in ["dt_evento", "placa", "descricao", "velocidade"] if c in df_hist_mot.columns]
+                st.dataframe(df_hist_mot[cols_prev], use_container_width=True, hide_index=True)
+
+                pdf_bytes = criar_pdf_motorista(mot_escolhido, df_hist_mot, setor_destino,
+                                                mensagem_gestor, evento_filtro_pdf, apenas_acima_120)
+                st.download_button(
+                    label="📥 Baixar relatório executivo em PDF",
+                    data=pdf_bytes,
+                    file_name=f"Relatorio_Executivo_{str(mot_escolhido).replace(' ', '_')}_{datetime.now():%Y%m%d}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Nenhum histórico encontrado para este colaborador com os filtros selecionados.")
+        else:
+            st.warning("Sem dados de motoristas disponíveis na base.")
+
+    with tab_excel:
+        if not df_unificado.empty:
+            st.markdown("**📊 Planilha consolidada por veículo**")
+            st.caption("Inclui odômetro, KM rodado, eventos Safe e CPS, total e KM por evento.")
+            st.download_button(
+                "📊 Baixar relatório Excel (.xlsx)",
+                data=gerar_excel(df_unificado),
+                file_name=f"Relatorio_Master_{datetime.now():%Y%m%d_%H%M}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.info("Sem dados para exportar com os filtros atuais.")
 
 # ==============================================================================
 # RODAPÉ
 # ==============================================================================
 st.markdown("---")
-st.markdown("""
-<div class="footer-bar">
-  <span><b>Gestor CEABS • API Complementar & Telemetria</b> | Arquitetura Unificada de Risco & Desempenho</span>
-  <span>Versão 2026.2</span>
-</div>""", unsafe_allow_html=True)
+st.markdown(
+    '<div class="rodape"><span><b>Gestão Frotas • Cockpit Executivo</b> | Mobilidade Frota</span>'
+    '<span class="badge-live">Sistema local • online</span></div>',
+    unsafe_allow_html=True,
+)
